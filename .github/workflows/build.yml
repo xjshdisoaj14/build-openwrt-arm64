@@ -16,12 +16,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并安装基础打包依赖（无需安装 qemu-utils）
+      # 2. 清理磁盘空间并补全所有构建依赖（关键：qemu-utils, dosfstools, mtools）
       - name: Free Disk Space & Install Dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y zstd make build-essential curl wget tar
+          sudo apt-get install -y zstd make build-essential curl wget tar qemu-utils dosfstools mtools
 
       # 3. 缓存 ImageBuilder 工具
       - name: Cache ImageBuilder
@@ -39,7 +39,7 @@ jobs:
           wget -qO- "$IB_URL" | tar -I zstd -xv
           mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armsr-armv8.Linux-x86_64 builder
 
-      # 5. 下载并解压 AdGuard Home ARM64
+      # 5. 集成 AdGuard Home ARM64
       - name: Integrate AdGuard Home ARM64 Binary
         run: |
           mkdir -p builder/files/opt
@@ -75,7 +75,7 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 7. 仅打包 RootFS (禁用所有虚拟机镜像构建)
+      # 7. 执行打包
       - name: Build RootFS with Packages
         run: |
           cd builder
@@ -90,19 +90,9 @@ jobs:
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates iptables"
 
-          # 通过 CONFIG_ 禁用 qcow2, vdi, vmdk, ext4/squashfs img 镜像生成，仅生成 rootfs.tar.gz
-          make image PROFILE="generic" \
-            PACKAGES="$PACKAGES" \
-            FILES="files" \
-            CONFIG_QCOW2_IMAGES=n \
-            CONFIG_VDI_IMAGES=n \
-            CONFIG_VMDK_IMAGES=n \
-            CONFIG_TARGET_ROOTFS_EXT4FS=n \
-            CONFIG_TARGET_ROOTFS_SQUASHFS=n \
-            CONFIG_TARGET_ROOTFS_TARGZ=y \
-            -j$(nproc)
+          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 仅上传生成的 RootFS tar.gz 归档包
+      # 8. 过滤输出：仅上传 RootFS tar.gz 归档包供 Docker 使用
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
