@@ -3,7 +3,6 @@ name: Build ImmortalWrt ARM64 RootFS
 on:
   workflow_dispatch:
 
-# 集中管理环境变量与版本控制
 env:
   IMMORTALWRT_VER: "25.12.1"
   ADGUARD_VER: "v0.107.77"
@@ -17,14 +16,14 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并安装必需依赖
+      # 2. 清理磁盘空间并安装基础打包依赖（无需安装 qemu-utils）
       - name: Free Disk Space & Install Dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y zstd make build-essential curl wget tar
 
-      # 3. 缓存 ImageBuilder 工具 (加速后续构建)
+      # 3. 缓存 ImageBuilder 工具
       - name: Cache ImageBuilder
         id: cache-ib
         uses: actions/cache@v4
@@ -32,7 +31,7 @@ jobs:
           path: builder
           key: ib-${{ env.IMMORTALWRT_VER }}-armsr-armv8
 
-      # 4. 下载并解压 ImageBuilder (缓存未命中时执行)
+      # 4. 下载并解压 ImageBuilder
       - name: Download & Extract ImageBuilder
         if: steps.cache-ib.outputs.cache-hit != 'true'
         run: |
@@ -40,13 +39,11 @@ jobs:
           wget -qO- "$IB_URL" | tar -I zstd -xv
           mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armsr-armv8.Linux-x86_64 builder
 
-      # 5. 下载并解压 AdGuard Home v0.107.77 Linux ARM64 二进制文件
+      # 5. 下载并解压 AdGuard Home ARM64
       - name: Integrate AdGuard Home ARM64 Binary
         run: |
           mkdir -p builder/files/opt
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/${ADGUARD_VER}/AdGuardHome_linux_arm64.tar.gz"
-          
-          # 解压并输出至 builder/files/opt/AdGuardHome 路径
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
@@ -78,7 +75,7 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 7. 多核并行打包 RootFS
+      # 7. 仅打包 RootFS (禁用所有虚拟机镜像构建)
       - name: Build RootFS with Packages
         run: |
           cd builder
@@ -93,15 +90,23 @@ jobs:
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates iptables"
 
-          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          # 通过 CONFIG_ 禁用 qcow2, vdi, vmdk, ext4/squashfs img 镜像生成，仅生成 rootfs.tar.gz
+          make image PROFILE="generic" \
+            PACKAGES="$PACKAGES" \
+            FILES="files" \
+            CONFIG_QCOW2_IMAGES=n \
+            CONFIG_VDI_IMAGES=n \
+            CONFIG_VMDK_IMAGES=n \
+            CONFIG_TARGET_ROOTFS_EXT4FS=n \
+            CONFIG_TARGET_ROOTFS_SQUASHFS=n \
+            CONFIG_TARGET_ROOTFS_TARGZ=y \
+            -j$(nproc)
 
-      # 8. 上传生成的 RootFS 文件 Artifact
+      # 8. 仅上传生成的 RootFS tar.gz 归档包
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-armsr-armv8-rootfs-${{ env.IMMORTALWRT_VER }}
-          path: |
-            builder/bin/targets/armsr/armv8/*rootfs.tar.gz
-            builder/bin/targets/armsr/armv8/*.manifest
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
