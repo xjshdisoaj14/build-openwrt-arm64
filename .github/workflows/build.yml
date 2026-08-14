@@ -33,7 +33,7 @@ jobs:
           cd builder
           mkdir -p files/opt
           cd files/opt
-          wget https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.66/AdGuardHome_v0.107.66_linux_arm64.tar.gz
+          wget https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.78/AdGuardHome_freebsd_arm64.tar.gz
           tar -zxvf AdGuardHome_v0.107.66_linux_arm64.tar.gz
           rm -f AdGuardHome_v0.107.66_linux_arm64.tar.gz
 
