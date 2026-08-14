@@ -1,0 +1,61 @@
+name: Build ImmortalWrt ARM64 RootFS
+
+# 支持在 GitHub 页面上手动点击按钮触发编译
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. 清理云端服务器磁盘空间
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y zstd make build-essential
+
+      # 3. 下载适用于 armsr-armv8 目标的 ImageBuilder 打包工具
+      - name: Download & Extract ImageBuilder
+        run: |
+          wget https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/immortalwrt-imagebuilder-25.12.1-armsr-armv8.Linux-x86_64.tar.zst
+          tar -I zstd -xvf immortalwrt-imagebuilder-25.12.1-armsr-armv8.Linux-x86_64.tar.zst
+          mv immortalwrt-imagebuilder-25.12.1-armsr-armv8.Linux-x86_64 builder
+
+      # 4. 预先注入 AdGuard Home 的 ARM64 二进制文件
+      - name: Integrate AdGuard Home ARM64 Binary
+        run: |
+          cd builder
+          mkdir -p files/opt
+          cd files/opt
+          wget https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.66/AdGuardHome_v0.107.66_linux_arm64.tar.gz
+          tar -zxvf AdGuardHome_v0.107.66_linux_arm64.tar.gz
+          rm -f AdGuardHome_v0.107.66_linux_arm64.tar.gz
+
+      # 5. 打包集成 PassWall、SmartDNS、SoftEther 等所有插件的 RootFS
+      - name: Build RootFS with Packages
+        run: |
+          cd builder
+          make image PROFILE="generic" \
+            PACKAGES="luci \
+                      luci-i18n-base-zh-cn \
+                      luci-theme-argon \
+                      vsftpd openssh-sftp-server \
+                      luci-i18n-passwall-zh-cn xray-core sing-box \
+                      luci-i18n-smartdns-zh-cn \
+                      luci-app-vlmcsd \
+                      luci-i18n-softethervpn-zh-cn \
+                      curl wget-ssl ca-certificates iptables-zz-legacy" \
+            FILES="files"
+
+      # 6. 上传生成的 RootFS 文件供下载
+      - name: Upload RootFS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-armsr-armv8-rootfs
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
