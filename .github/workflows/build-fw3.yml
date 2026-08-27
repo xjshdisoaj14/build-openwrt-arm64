@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 21.02 (FW3) RootFS for Docker ARM64
+name: Build ImmortalWrt 21.02.7 (FW3) RootFS
 
 on:
   workflow_dispatch:
@@ -16,14 +16,14 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并安装构建依赖
+      # 2. 清理磁盘空间并补全所有构建依赖
       - name: Free Disk Space & Install Dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools
 
-      # 3. 缓存 21.02.7 (FW3) ImageBuilder
+      # 3. 缓存 21.02.7 ImageBuilder 工具
       - name: Cache ImageBuilder
         id: cache-ib
         uses: actions/cache@v4
@@ -31,13 +31,13 @@ jobs:
           path: builder
           key: ib-${{ env.IMMORTALWRT_VER }}-armvirt-64
 
-      # 4. 下载并解压 21.02.7 官方 FW3 ImageBuilder (.tar.xz 格式)
+      # 4. 下载并解压 21.02.7 armvirt/64 ImageBuilder (使用 .tar.xz)
       - name: Download & Extract ImageBuilder
         if: steps.cache-ib.outputs.cache-hit != 'true'
         run: |
           IB_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.xz"
-          mkdir -p builder
-          wget -qO- "$IB_URL" | tar -xJ --strip-components=1 -C builder
+          wget -qO- "$IB_URL" | tar -xJ
+          mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
 
       # 5. 集成 AdGuard Home ARM64
       - name: Integrate AdGuard Home ARM64 Binary
@@ -75,45 +75,28 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 7. 预下载第三方 PassWall ipk 包入本地Packages池
-      - name: Pre-download Passwall Packages
-        run: |
-          mkdir -p builder/packages
-          cd builder/packages
-          
-          # 自动获取并下载 PassWall 最新编译好适用于 21.02 的 ipk 文件
-          PW_RELEASE_URL="https://api.github.com/repos/xiaorouji/openwrt-passwall/releases/latest"
-          DOWNLOAD_URLS=$(curl -s $PW_RELEASE_URL | grep "browser_download_url" | grep -E "passwall.*\.ipk" | cut -d '"' -f 4)
-          
-          for url in $DOWNLOAD_URLS; do
-            echo "Downloading: $url"
-            wget -q "$url" || true
-          done
-
-      # 8. 打包基于 FW3 (iptables) 的 RootFS
+      # 7. 执行打包 (专用于 armvirt/64 架构，使用 PROFILE="")
       - name: Build RootFS with Packages
         run: |
           cd builder
           
-          # vsftpd 已修正为 vsftpd-alt
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
-            vsftpd-alt openssh-sftp-server \
-            luci-app-passwall luci-i18n-passwall-zh-cn xray-core sing-box \
+            vsftpd openssh-sftp-server \
+            luci-i18n-passwall-zh-cn xray-core sing-box \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
-            curl wget-ssl ca-certificates \
-            iptables ipset kmod-ipt-nat kmod-ipt-tproxy"
+            curl wget-ssl ca-certificates iptables"
 
-          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 9. 上传 RootFS 归档包 (供 Docker 使用)
+      # 8. 过滤输出：上传 RootFS tar.gz 归档包供 Docker 使用
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-21.02.7-fw3-armvirt-64-rootfs
+          name: immortalwrt-21.02.7-armvirt-64-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
