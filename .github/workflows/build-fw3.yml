@@ -107,7 +107,7 @@ jobs:
             curl wget-ssl ca-certificates \
             iptables ipset kmod-ipt-nat kmod-ipt-tproxy"
 
-          make image PROFILE="default" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
       # 9. 上传 RootFS 归档包 (供 Docker 使用)
       - name: Upload RootFS Artifact
