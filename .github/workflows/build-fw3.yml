@@ -31,7 +31,7 @@ jobs:
           path: builder
           key: ib-${{ env.IMMORTALWRT_VER }}-armvirt-64
 
-      # 4. 下载并解压 21.02.7 armvirt/64 ImageBuilder (使用 .tar.xz)
+      # 4. 下载并解压 21.02.7 armvirt/64 ImageBuilder
       - name: Download & Extract ImageBuilder
         if: steps.cache-ib.outputs.cache-hit != 'true'
         run: |
@@ -75,12 +75,13 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 7. 执行打包 (专用于 armvirt/64 架构，使用 PROFILE="")
+      # 7. 执行打包 (PROFILE="" 专用于 armvirt/64 架构；-dnsmasq 避免 255 冲突)
       - name: Build RootFS with Packages
         run: |
           cd builder
           
-          PACKAGES="luci \
+          PACKAGES="-dnsmasq dnsmasq-full \
+            luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
@@ -92,7 +93,7 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 过滤输出：上传 RootFS tar.gz 归档包供 Docker 使用
+      # 8. 过滤输出：仅上传 RootFS tar.gz 归档包供 Docker 使用
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
