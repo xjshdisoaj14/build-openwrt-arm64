@@ -1,13 +1,15 @@
-name: Build ImmortalWrt 25.12.1 (FW4) RootFS with Mihomo
+name: Build ImmortalWrt (FW4 - High Stability)
 
 on:
   workflow_dispatch:
 
 env:
-  IMMORTALWRT_VER: "25.12.1"
+  IMMORTALWRT_VER: "23.05.3"
+  ADGUARD_VER: "v0.107.77"
 
 jobs:
   build:
+    name: Build ImmortalWrt FW4 RootFS
     runs-on: ubuntu-latest
 
     steps:
@@ -15,59 +17,84 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并安装构建依赖 (支持 zstd)
+      # 2. 清理磁盘空间并安装构建依赖
       - name: Free Disk Space & Install Dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y zstd make build-essential curl wget tar qemu-utils dosfstools mtools
+          sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools
 
-      # 3. 缓存 25.12.1 ImageBuilder
-      - name: Cache ImageBuilder
-        id: cache-ib
-        uses: actions/cache@v4
-        with:
-          path: builder
-          key: ib-${{ env.IMMORTALWRT_VER }}-armsr-armv8
-
-      # 4. 下载并解压 25.12.1 官方 ImageBuilder (.tar.zst 格式)
+      # 3. 下载并解压 23.05.3 (FW4) ImageBuilder
       - name: Download & Extract ImageBuilder
-        if: steps.cache-ib.outputs.cache-hit != 'true'
         run: |
-          IB_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armsr/armv8/immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armsr-armv8.Linux-x86_64.tar.zst"
-          mkdir -p builder
-          wget -qO- "$IB_URL" | tar -I zstd -xv --strip-components=1 -C builder
+          IB_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.xz"
+          wget -qO- "$IB_URL" | tar -xJ
+          mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
 
-      # 5. 追加 Mihomo 官方第三方软件源 (适配 FW4 与 APK 包管理器)
-      - name: Add Mihomo Third-party Repository
+      # 4. 集成 AdGuard Home ARM64 二进制文件
+      - name: Integrate AdGuard Home ARM64 Binary
         run: |
-          cat << 'EOF' >> builder/repositories.conf
-          src/gz mihomo https://openwrt-mihomo.morytyann.com/releases/25.12/packages/aarch64_cortex-a53/mihomo
+          mkdir -p builder/files/opt
+          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/${ADGUARD_VER}/AdGuardHome_linux_arm64.tar.gz"
+          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
+          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
+
+      # 5. 配置 AdGuard Home 服务开机自启
+      - name: Configure AdGuard Home Service Auto-start
+        run: |
+          mkdir -p builder/files/etc/init.d
+          cat << 'EOF' > builder/files/etc/init.d/adguardhome
+          #!/bin/sh /etc/rc.common
+
+          START=99
+          STOP=10
+
+          USE_PROCD=1
+          PROCD_DEBUG=1
+
+          PROG=/opt/AdGuardHome/AdGuardHome
+          WORK_DIR=/opt/AdGuardHome
+
+          start_service() {
+              procd_open_instance
+              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
+              procd_set_param respawn
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
           EOF
 
-      # 6. 打包 FW4 RootFS (修复包名 vsftpd，在线解析 mihomo 依赖)
-      - name: Build RootFS with Packages
+          chmod +x builder/files/etc/init.d/adguardhome
+
+      # 6. 打包 RootFS (完美解决 Passwall 在 FW4 下的兼容性问题)
+      - name: Build RootFS
         run: |
           cd builder
           
-          # vsftpd 已还原为标准包名
-          PACKAGES="luci \
+          # 核心打包策略：
+          # 1. 放弃替换 dnsmasq-full，使用默认 dnsmasq 搭配 ipset/iptables-nft 兼容层，规避死锁。
+          # 2. 安装 iptables-nft, kmod-ipt-nat, ipset：让 PassWall 在 FW4 环境下依然能用最稳定的 iptables 规则链接管流量。
+          # 3. 保留 sing-box 和 xray-core：提供全协议支持。
+          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+            luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            luci-app-mihomo mihomo \
+            luci-i18n-passwall-zh-cn xray-core sing-box \
+            luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
-            kmod-nft-tproxy kmod-tun"
+            iptables-nft ipset kmod-ipt-nat kmod-ipt-tproxy"
 
-          make image PROFILE="generic" PACKAGES="$PACKAGES" -j$(nproc)
+          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 7. 上传 RootFS 归档包 (供 Docker 使用)
+      # 7. 上传 RootFS 归档包供 Docker 使用
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-fw4-mihomo-armsr-armv8-rootfs
-          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+          name: immortalwrt-23.05.3-fw4-stable-rootfs
+          path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
