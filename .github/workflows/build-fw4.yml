@@ -1,0 +1,81 @@
+name: Build ImmortalWrt 25.12.1 (FW4) RootFS with Mihomo
+
+on:
+  workflow_dispatch:
+
+env:
+  IMMORTALWRT_VER: "25.12.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. 清理磁盘空间并安装构建依赖 (zstd 支持)
+      - name: Free Disk Space & Install Dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get update
+          sudo apt-get install -y zstd make build-essential curl wget tar qemu-utils dosfstools mtools
+
+      # 3. 缓存 25.12.1 ImageBuilder
+      - name: Cache ImageBuilder
+        id: cache-ib
+        uses: actions/cache@v4
+        with:
+          path: builder
+          key: ib-${{ env.IMMORTALWRT_VER }}-armsr-armv8
+
+      # 4. 下载并解压 25.12.1 官方 ImageBuilder (.tar.zst 格式)
+      - name: Download & Extract ImageBuilder
+        if: steps.cache-ib.outputs.cache-hit != 'true'
+        run: |
+          IB_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armsr/armv8/immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armsr-armv8.Linux-x86_64.tar.zst"
+          mkdir -p builder
+          wget -qO- "$IB_URL" | tar -I zstd -xv --strip-components=1 -C builder
+
+      # 5. 预下载第三方 Mihomo / Nikki 控制前端与核心 ipk
+      - name: Pre-download Mihomo Packages
+        run: |
+          mkdir -p builder/packages
+          cd builder/packages
+          
+          # 自动获取并下载社区维护的 luci-app-mihomo 最新版 ipk
+          MIHOMO_RELEASE_URL="https://api.github.com/repos/morytyann/OpenWrt-mihomo/releases/latest"
+          DOWNLOAD_URLS=$(curl -s $MIHOMO_RELEASE_URL | grep "browser_download_url" | grep -E ".*\.ipk" | cut -d '"' -f 4)
+          
+          for url in $DOWNLOAD_URLS; do
+            echo "Downloading: $url"
+            wget -q "$url" || true
+          done
+
+      # 6. 打包纯净、安全的 FW4 RootFS (完全移除 passwall, adg, smartdns)
+      - name: Build RootFS with Packages
+        run: |
+          cd builder
+          
+          # 仅保留纯粹、极简且原生适配 fw4/nftables 的基础环境
+          PACKAGES="luci \
+            luci-i18n-base-zh-cn \
+            luci-theme-argon \
+            vsftpd-alt openssh-sftp-server \
+            luci-app-mihomo mihomo \
+            luci-app-vlmcsd \
+            luci-i18n-softethervpn-zh-cn \
+            curl wget-ssl ca-certificates \
+            kmod-nft-tproxy kmod-tun"
+
+          make image PROFILE="generic" PACKAGES="$PACKAGES" -j$(nproc)
+
+      # 7. 上传 RootFS 归档包 (供 Docker 使用)
+      - name: Upload RootFS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-25.12.1-fw4-mihomo-armsr-armv8-rootfs
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+          if-no-files-found: error
+          retention-days: 7
