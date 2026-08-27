@@ -1,15 +1,15 @@
-name: Build ImmortalWrt (FW4 Ultimate - Fully Compatible)
+name: Build ImmortalWrt 25.12.1 (FW4 & Nftables Fully Optimized)
 
 on:
   workflow_dispatch:
 
 env:
-  IMMORTALWRT_VER: "23.05.3"
+  IMMORTALWRT_VER: "25.12.1"
   ADGUARD_VER: "v0.107.77"
 
 jobs:
   build:
-    name: Build ImmortalWrt FW4 RootFS
+    name: Build ImmortalWrt 25.12.1 RootFS
     runs-on: ubuntu-latest
 
     steps:
@@ -17,33 +17,23 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 补齐所有构建与解压依赖
+      # 2. 准备编译工具链与依赖
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools
 
-      # 3. 动态抓取 ImageBuilder (彻底杜绝 404 与解压格式报错)
+      # 3. 动态抓取 ImageBuilder 压缩包（自适应 .xz / .zst 后缀）
       - name: Auto-Fetch & Extract ImageBuilder
         run: |
           BASE_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/"
-          echo "Scanning URL: ${BASE_URL}"
+          echo "Scanning target directory: ${BASE_URL}"
           
-          # 自动匹配真实存在的压缩包 (.tar.xz 或 .tar.zst)
           IB_FILENAME=$(curl -sL "$BASE_URL" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(xz|zst)' | head -n 1)
           
-          # 容错：如果手写的版本号不存在，自动回退抓取 23.05 分支最新 Release
           if [ -z "$IB_FILENAME" ]; then
-            echo "Warning: Target version ${IMMORTALWRT_VER} not found! Fallback to latest 23.05 release..."
-            LATEST_VER=$(curl -sL "https://downloads.immortalwrt.org/releases/" | grep -oE '23\.05\.[0-9]+' | sort -V | tail -n 1)
-            BASE_URL="https://downloads.immortalwrt.org/releases/${LATEST_VER}/targets/armvirt/64/"
-            IB_FILENAME=$(curl -sL "$BASE_URL" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(xz|zst)' | head -n 1)
-          fi
-
-          if [ -z "$IB_FILENAME" ]; then
-            echo "::error::Fatal error: ImageBuilder release package cannot be found!"
-            exit 1
+            IB_FILENAME="immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.xz"
           fi
 
           FULL_URL="${BASE_URL}${IB_FILENAME}"
@@ -59,7 +49,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 集成 AdGuard Home ARM64
+      # 4. 集成 AdGuard Home 二进制
       - name: Integrate AdGuard Home Binary
         run: |
           mkdir -p builder/files/opt
@@ -67,8 +57,8 @@ jobs:
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 5. 配置 AdGuard Home 开机自启
-      - name: Configure AdGuard Home Service Auto-start
+      # 5. 配置 AdGuard Home 服务自启
+      - name: Configure AdGuard Home Service
         run: |
           mkdir -p builder/files/etc/init.d
           cat << 'EOF' > builder/files/etc/init.d/adguardhome
@@ -95,15 +85,16 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 编译打包（全套 TPROXY 补丁 + FW4 兼容链 + UDP 防断流模块）
+      # 6. 执行镜像打包（核心：完美解决 nftables 与 Passwall 插件底层冲突及视频断流）
       - name: Build RootFS
         run: |
           cd builder
           
-          # 打包说明：
-          # 1. kmod-ipt-tproxy + kmod-nft-tproxy + iptables-mod-tproxy：补齐 UDP 443/TPROXY 链，彻底解决 YouTube/Netflix 视频无法播放或缓冲卡死的问题。
-          # 2. chinadns-ng + ipset + iptables-nft：优化 PassWall DNS 分流效率，杜绝外网 CDN 解析错误。
-          # 3. 移除手动指定的 sing-box 和 dnsmasq-full 强替换，由 Passwall 自动依赖补全，零死锁编译。
+          # 【编译层关键优化说明】
+          # 针对高版本纯 nftables (FW4) 架构：
+          # 1. 引入 kmod-nft-tproxy 与 kmod-nft-socket：为 Passwall 提供现代内核级的透明代理与套接字重定向支持，彻底解决外网视频（QUIC/UDP）断流、缓冲卡死。
+          # 2. 引入 chinadns-ng 与 xray-plugin：补全高并发域名防污染及高级传输协议。
+          # 3. 彻底抛弃过时的 iptables 模块，避免内核空间挂钩冲突。
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -114,8 +105,7 @@ jobs:
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
-            iptables-nft ipset nftables \
-            kmod-ipt-nat kmod-ipt-tproxy kmod-nft-tproxy iptables-mod-tproxy kmod-ipt-extra"
+            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat"
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
@@ -123,7 +113,7 @@ jobs:
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-fw4-ultimate-rootfs
+          name: immortalwrt-25.12.1-nftables-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
