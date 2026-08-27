@@ -75,12 +75,15 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 7. 执行打包 (PROFILE="" 专用于 armvirt/64 架构；-dnsmasq 避免 255 冲突)
+      # 7. 执行打包：剥离 IPv6 模块与默认 dnsmasq，开启强制覆盖
       - name: Build RootFS with Packages
         run: |
           cd builder
           
-          PACKAGES="-dnsmasq dnsmasq-full \
+          # 1. 减号(-)彻底卸载: 所有 dnsmasq 变体以及 IPv6 相关组件 (odhcp6c, odhcpd-ipv6only, kmod-ipv6 等)
+          # 2. 补全安装: dnsmasq-full 及常用依赖
+          PACKAGES="-dnsmasq -dnsmasq-dhcpv6 -odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+            dnsmasq-full \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
@@ -91,9 +94,10 @@ jobs:
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates iptables"
 
-          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          # 传入 --force-overwrite 强制解决 opkg 文件替换死锁
+          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" OPKG_ARGS="--force-overwrite --force-downgrade" -j$(nproc)
 
-      # 8. 过滤输出：仅上传 RootFS tar.gz 归档包供 Docker 使用
+      # 8. 上传 RootFS 归档包供 Docker 使用
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
