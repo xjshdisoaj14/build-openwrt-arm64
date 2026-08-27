@@ -1,0 +1,92 @@
+name: Build ImmortalWrt 21.02.7 (FW3 - Solution C)
+
+on:
+  workflow_dispatch:
+
+env:
+  IMMORTALWRT_VER: "21.02.7"
+  ADGUARD_VER: "v0.107.77"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space & Install Dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get update
+          sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools
+
+      - name: Download & Extract Fresh ImageBuilder
+        run: |
+          IB_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.xz"
+          wget -qO- "$IB_URL" | tar -xJ
+          mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
+
+      - name: Integrate AdGuard Home ARM64 Binary
+        run: |
+          mkdir -p builder/files/opt
+          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/${ADGUARD_VER}/AdGuardHome_linux_arm64.tar.gz"
+          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
+          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
+
+      - name: Configure AdGuard Home Service Auto-start
+        run: |
+          mkdir -p builder/files/etc/init.d
+          cat << 'EOF' > builder/files/etc/init.d/adguardhome
+          #!/bin/sh /etc/rc.common
+
+          START=99
+          STOP=10
+
+          USE_PROCD=1
+          PROCD_DEBUG=1
+
+          PROG=/opt/AdGuardHome/AdGuardHome
+          WORK_DIR=/opt/AdGuardHome
+
+          start_service() {
+              procd_open_instance
+              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
+              procd_set_param respawn
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+          EOF
+
+          chmod +x builder/files/etc/init.d/adguardhome
+
+      - name: Pre-clean Environment & Build RootFS
+        run: |
+          cd builder
+
+          # 禁用 Actions 缓存以防残余的锁文件干扰；手动建立基础结构
+          mkdir -p files/etc/config
+          mkdir -p files/lib/netifd
+
+          PACKAGES="-dnsmasq -dnsmasq-dhcpv6 -odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+            dnsmasq-full \
+            luci \
+            luci-i18n-base-zh-cn \
+            luci-theme-argon \
+            vsftpd openssh-sftp-server \
+            luci-i18n-passwall-zh-cn xray-core sing-box \
+            luci-i18n-smartdns-zh-cn \
+            luci-app-vlmcsd \
+            luci-i18n-softethervpn-zh-cn \
+            curl wget-ssl ca-certificates iptables"
+
+          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j1
+
+      - name: Upload RootFS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-21.02.7-armvirt-64-rootfs
+          path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
+          if-no-files-found: error
+          retention-days: 7
