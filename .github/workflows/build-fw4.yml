@@ -17,36 +17,27 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并安装构建依赖（包含 zstd 动态解压工具）
+      # 2. 清理磁盘空间并安装构建依赖（包含 zstd 工具）
       - name: Free Disk Space & Install Dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar zstd qemu-utils dosfstools mtools
 
-      # 3. 动态下载并解压 FW4 ImageBuilder（安全校验，自动兼容 tar.xz 与 tar.zst）
+      # 3. 稳健下载并解压 ImageBuilder (精准匹配 23.05.3 的 tar.zst 格式)
       - name: Download & Extract ImageBuilder
         run: |
-          BASE_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64"
+          IB_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.zst"
           
-          # 自动获取当前目录下真实的 ImageBuilder 文件名
-          FILE_NAME=$(curl -sL "$BASE_URL/" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(xz|zst)' | head -n 1)
+          echo "Downloading ImageBuilder from: ${IB_URL}"
+          mkdir -p builder
           
-          if [ -z "$FILE_NAME" ]; then
-            echo "Error: Cannot find ImageBuilder package at $BASE_URL"
-            exit 1
-          fi
-
-          echo "Downloading $FILE_NAME ..."
-          wget -q "${BASE_URL}/${FILE_NAME}" -O ib_package
-
-          mkdir builder
-          if [[ "$FILE_NAME" == *.zst ]]; then
-            tar --use-compress-program=unescp -xf ib_package -C builder --strip-components=1 2>/dev/null || tar --zstd -xf ib_package -C builder --strip-components=1
-          else
-            tar -xf ib_package -C builder --strip-components=1
-          fi
-          rm -f ib_package
+          # 使用 curl -fL 确保遇到 404 时立即报错退出，并跟随 HTTP 重定向
+          curl -fL "$IB_URL" -o ib_package.tar.zst
+          
+          # 使用 zstd + tar 进行解压
+          tar --zstd -xf ib_package.tar.zst -C builder --strip-components=1
+          rm -f ib_package.tar.zst
 
       # 4. 集成 AdGuard Home ARM64 二进制文件
       - name: Integrate AdGuard Home ARM64 Binary
@@ -84,7 +75,7 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 打包 RootFS (带有 FW4 iptables-nft 兼容层)
+      # 6. 执行打包 (保留 iptables-nft 兼容层，确保 PassWall 在 FW4 上极速稳定运行)
       - name: Build RootFS
         run: |
           cd builder
@@ -103,7 +94,7 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 7. 上传 RootFS 归档包供 Docker 使用
+      # 7. 上传 RootFS 归档包
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
