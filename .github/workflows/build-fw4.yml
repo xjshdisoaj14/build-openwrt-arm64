@@ -1,15 +1,11 @@
-name: Build ImmortalWrt 25.12.1 (NextGen Lightweight & Fast)
+name: Build ImmortalWrt NextGen (Mihomo FW4 Optimized)
 
 on:
   workflow_dispatch:
 
-env:
-  IMMORTALWRT_VER: "25.12.1"
-  ADGUARD_VER: "v0.107.77"
-
 jobs:
   build:
-    name: Build ImmortalWrt 25.12.1 RootFS
+    name: Build ImmortalWrt RootFS
     runs-on: ubuntu-latest
 
     steps:
@@ -17,23 +13,33 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链
+      # 2. 准备编译工具链 (支持 xz 和 zstd)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 3. 动态抓取 ImageBuilder 压缩包
-      - name: Auto-Fetch & Extract ImageBuilder
+      # 3. 动态获取官方真实存在的最新的 Release 版本与 ImageBuilder URL (彻底杜绝 404)
+      - name: Auto-Discover & Download ImageBuilder
         run: |
-          BASE_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/"
-          echo "Scanning target directory: ${BASE_URL}"
+          # 自动匹配官方 releases 页面中真实存在的最新稳定版
+          LATEST_VER=$(curl -sL "https://downloads.immortalwrt.org/releases/" | grep -oE '[0-9]{2}\.[0-9]{2}\.[0-9]+' | sort -V | tail -n 1)
           
+          if [ -z "$LATEST_VER" ]; then
+            echo "Failed to auto-detect version, using verified fallback release 23.05.4"
+            LATEST_VER="23.05.4"
+          fi
+
+          echo "Detected Latest ImmortalWrt Version: ${LATEST_VER}"
+          BASE_URL="https://downloads.immortalwrt.org/releases/${LATEST_VER}/targets/armvirt/64/"
+          
+          # 动态匹配 Index 页面中真实存在的文件名 (.tar.xz 或 .tar.zst)
           IB_FILENAME=$(curl -sL "$BASE_URL" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(xz|zst)' | head -n 1)
-          
+
           if [ -z "$IB_FILENAME" ]; then
-            IB_FILENAME="immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.xz"
+            echo "::error::ImageBuilder package not found under ${BASE_URL}"
+            exit 1
           fi
 
           FULL_URL="${BASE_URL}${IB_FILENAME}"
@@ -53,11 +59,11 @@ jobs:
       - name: Integrate AdGuard Home Binary
         run: |
           mkdir -p builder/files/opt
-          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/${ADGUARD_VER}/AdGuardHome_linux_arm64.tar.gz"
+          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 5. 配置 AdGuard Home 服务自启动脚本
+      # 5. 配置 AdGuard Home 服务自启
       - name: Configure AdGuard Home Service
         run: |
           mkdir -p builder/files/etc/init.d
@@ -85,21 +91,22 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 打包 RootFS（使用基于 Sing-Box 核心的原生高隐蔽、轻量化软件组合）
+      # 6. 打包 RootFS（极致安全、隐蔽、快速、轻量的 Mihomo 生态组合）
       - name: Build RootFS
         run: |
           cd builder
           
-          # 【安全、隐蔽、快速、轻量打包策略】
-          # 1. 精简内核：剔除 IPv6 冗余模块减少攻击面；
-          # 2. 现代内核转发：打包 kmod-nft-tproxy 与 sing-box，完美支持 Hysteria 2 / REALITY 等极致隐蔽与抗封锁协议；
-          # 3. 轻量化 DNS 分流：SmartDNS + AdGuardHome，降低系统负载。
+          # 【打包策略与架构优势】
+          # 1. 安全与隐蔽：luci-app-mihomo + mihomo 核心，完美支持 Hysteria 2 / VLESS-REALITY / TUIC v5 协议；
+          # 2. 快速与轻量：纯 nftables TPROXY 转发（kmod-nft-tproxy + kmod-nft-socket），规避 iptables 性能损耗；
+          # 3. SmartDNS + AdGuardHome 构建高并发防污染 DNS 链；
+          # 4. 精简 IPv6，降低系统开销与攻击面。
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            sing-box luci-app-nikki \
+            mihomo luci-app-mihomo luci-i18n-mihomo-zh-cn \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
@@ -112,7 +119,7 @@ jobs:
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-nextgen-rootfs
+          name: immortalwrt-mihomo-fw4-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
