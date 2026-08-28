@@ -1,4 +1,4 @@
-name: Build ImmortalWrt NextGen (Mihomo FW4 Optimized)
+name: Build ImmortalWrt 25.12.1 (ARMSR Fast & FW4 Optimized)
 
 on:
   workflow_dispatch:
@@ -13,65 +13,34 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链 (确保支持 zstd 和 xz)
+      # 2. 准备编译工具链
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 3. 动态识别与抓取官方镜像（支持 armsr/armv8 与 armvirt/64 双重回溯，彻底解决 404）
-      - name: Auto-Discover & Download ImageBuilder
+      # 3. 直连目标地址提取 ImageBuilder（极速，免去漫长的遍历扫描）
+      - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
-          BASE_URL="https://downloads.immortalwrt.org/releases"
+          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
+          echo "Connecting to target repository: ${TARGET_DIR}"
 
-          echo "==> 正在扫描 ImmortalWrt 官方所有 Stable Release 版本..."
-          VERSIONS=$(curl -sL "${BASE_URL}/" | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/"' | cut -d'"' -f2 | tr -d '/' | sort -V -r)
+          # 从页面中精准抓取包含 imagebuilder 且后缀为 tar.zst 或 tar.xz 的文件名
+          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
-          FOUND_URL=""
-          SELECTED_VER=""
-          ARCH_TYPE=""
-
-          # 依次遍历各版本，优先检测新架构 armsr/armv8，次选旧架构 armvirt/64
-          for VER in $VERSIONS; do
-            for ARCH in "armsr/armv8" "armvirt/64"; do
-              TARGET_DIR="${BASE_URL}/${VER}/targets/${ARCH}"
-              echo "检查: Version ${VER} [${ARCH}]..."
-
-              # 抓取包含 imagebuilder 且后缀为 .tar.zst 或 .tar.xz 的真实文件名
-              IB_FILE=$(curl -sL "${TARGET_DIR}/" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
-
-              if [ -n "$IB_FILE" ]; then
-                DOWNLOAD_URL="${TARGET_DIR}/${IB_FILE}"
-                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$DOWNLOAD_URL")
-                if [ "$HTTP_CODE" -eq 200 ]; then
-                  FOUND_URL="$DOWNLOAD_URL"
-                  SELECTED_VER="$VER"
-                  ARCH_TYPE="$ARCH"
-                  IB_FILENAME="$IB_FILE"
-                  break 2
-                fi
-              fi
-            done
-          done
-
-          if [ -z "$FOUND_URL" ]; then
-            echo "::error::未能在官方源找到有效的 ImageBuilder 下载包！"
+          if [ -z "$IB_FILE" ]; then
+            echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
             exit 1
           fi
 
-          echo "=============================================="
-          echo "成功找到可用镜像源:"
-          echo "版本: ${SELECTED_VER}"
-          echo "架构: ${ARCH_TYPE}"
-          echo "链接: ${FOUND_URL}"
-          echo "=============================================="
+          DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
+          echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
 
-          # 下载并解压
-          curl -sL "$FOUND_URL" -o ib_package.archive
+          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
 
-          if [[ "$IB_FILENAME" == *.zst ]]; then
+          if [[ "$IB_FILE" == *.zst ]]; then
             tar --zstd -xf ib_package.archive -C builder --strip-components=1
           else
             tar -xf ib_package.archive -C builder --strip-components=1
@@ -86,7 +55,7 @@ jobs:
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 5. 配置 AdGuard Home 服务自启
+      # 5. 配置 AdGuard Home 服务自启动
       - name: Configure AdGuard Home Service
         run: |
           mkdir -p builder/files/etc/init.d
@@ -114,22 +83,22 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 打包 RootFS（极致安全、隐蔽、快速、轻量的 Mihomo 原生 nftables 组合）
+      # 6. 执行镜像打包（适配 25.12.1 apk 包名的现代轻量组合）
       - name: Build RootFS
         run: |
           cd builder
-          
-          # 【打包策略与架构优势】
-          # 1. 隐蔽与安全：luci-app-mihomo 原生完美支持 Hysteria 2 / VLESS-REALITY / TUIC v5 / ShadowTLS 等抗封锁协议；
-          # 2. 快速与轻量：纯 nftables TPROXY 转发（kmod-nft-tproxy + kmod-nft-socket），彻底告别 iptables 兼容层性能损耗；
-          # 3. 高效 DNS 防污染：SmartDNS + AdGuardHome 构建高并发解析链；
-          # 4. 彻底屏蔽 IPv6 模块，减少网络攻击面与不必要的开销。
+
+          # 【25.12.1 软件打包调优说明】
+          # 1. 采用官方源标准收录的 nikki (Mihomo 核心) 与 luci-app-nikki，完美支持 Hysteria 2 / REALITY / TUIC v5；
+          # 2. 移除旧版的 luci-i18n-mihomo-zh-cn（25.12.1 的 apk 包已将语言整合包含在主包中）；
+          # 3. 开启 kmod-nft-tproxy + kmod-nft-socket，保障 FW4 环境下的内核级 UDP / QUIC 高吞吐；
+          # 4. 彻底禁用 IPv6 模块以减少系统资源损耗及安全隐患。
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            mihomo luci-app-mihomo luci-i18n-mihomo-zh-cn \
+            nikki luci-app-nikki \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
@@ -138,11 +107,11 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 7. 上传编译 RootFS 产物
+      # 7. 上传 RootFS 编译产物
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-mihomo-rootfs
-          path: builder/bin/targets/*/*/*rootfs.tar.gz
+          name: immortalwrt-25.12.1-armsr-rootfs
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
