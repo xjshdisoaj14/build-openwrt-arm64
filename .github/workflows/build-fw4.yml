@@ -1,10 +1,9 @@
-name: Build ImmortalWrt 25.12.1 (FW4 & Nftables Optimized)
+name: Build ImmortalWrt 25.12.1 (NextGen Lightweight & Fast)
 
 on:
   workflow_dispatch:
 
 env:
-  # 锁定最新的 ImmortalWrt 25.12.1
   IMMORTALWRT_VER: "25.12.1"
   ADGUARD_VER: "v0.107.77"
 
@@ -18,25 +17,22 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 补齐编译环境工具链 (支持 xz 和 zstd)
+      # 2. 准备编译工具链
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools
 
-      # 3. 动态识别文件名 (.tar.xz 或 .tar.zst)，彻底解决下载 404 及解压失败
+      # 3. 动态抓取 ImageBuilder 压缩包
       - name: Auto-Fetch & Extract ImageBuilder
         run: |
           BASE_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/"
           echo "Scanning target directory: ${BASE_URL}"
           
-          # 动态匹配 Index 页面中真实存在的文件名
           IB_FILENAME=$(curl -sL "$BASE_URL" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(xz|zst)' | head -n 1)
           
-          # 兜底：若动态正则提取为空，回退至标准命名
           if [ -z "$IB_FILENAME" ]; then
-            echo "Warning: Dynamic extraction failed, falling back to standard format..."
             IB_FILENAME="immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.xz"
           fi
 
@@ -46,7 +42,6 @@ jobs:
           mkdir -p builder
           curl -fL "$FULL_URL" -o ib_package.archive
 
-          # 自动识别后缀解压
           if [[ "$IB_FILENAME" == *.zst ]]; then
             tar --zstd -xf ib_package.archive -C builder --strip-components=1
           else
@@ -63,7 +58,7 @@ jobs:
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
       # 5. 配置 AdGuard Home 服务自启动脚本
-      - name: Configure AdGuard Home Service Auto-start
+      - name: Configure AdGuard Home Service
         run: |
           mkdir -p builder/files/etc/init.d
           cat << 'EOF' > builder/files/etc/init.d/adguardhome
@@ -90,21 +85,21 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 执行镜像打包（纯 Nftables/FW4 深度优化配置）
+      # 6. 打包 RootFS（使用基于 Sing-Box 核心的原生高隐蔽、轻量化软件组合）
       - name: Build RootFS
         run: |
           cd builder
           
-          # 打包说明：
-          # 1. 禁用 IPv6 (根据此前环境定制)；
-          # 2. 引入 kmod-nft-tproxy 与 kmod-nft-socket：为 PassWall 解决 FW4 下 UDP 443 (QUIC) / 视频流断流卡顿；
-          # 3. 包含 PassWall、SmartDNS、SoftEther VPN、VLMCSD 及 Argon 主题。
+          # 【安全、隐蔽、快速、轻量打包策略】
+          # 1. 精简内核：剔除 IPv6 冗余模块减少攻击面；
+          # 2. 现代内核转发：打包 kmod-nft-tproxy 与 sing-box，完美支持 Hysteria 2 / REALITY 等极致隐蔽与抗封锁协议；
+          # 3. 轻量化 DNS 分流：SmartDNS + AdGuardHome，降低系统负载。
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            luci-i18n-passwall-zh-cn xray-core xray-plugin chinadns-ng \
+            sing-box luci-app-nikki \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
@@ -113,11 +108,11 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 7. 上传编译生成的 RootFS 产物
+      # 7. 上传编译产物
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-fw4-rootfs
+          name: immortalwrt-25.12.1-nextgen-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
