@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    name: Build ImmortalWrt RootFS Nikki
+    name: Build ImmortalWrt RootFS
     runs-on: ubuntu-latest
 
     steps:
@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链
+      # 2. 准备编译工具链 (支持 zstd 与 xz)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
@@ -82,16 +82,15 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 配置 Nikki 官方软件源并编译 RootFS
+      # 6. 配置 Nikki (Mihomo UI) 官方软件源并编译 RootFS
       - name: Add Nikki Feed & Build RootFS
         run: |
           cd builder
 
-          # A. 将 Nikki 官方针对 OpenWrt 25.12 / aarch64_generic 的第三方源写入 repositories.conf
-          # 这样 ImageBuilder 在解析 apk 包时就能直接找到 nikki 与 mihomo 包
+          # 写入 Nikki 官方预编译包源，提供 nikki、mihomo 核心与中文语言包
           echo "src/gz nikki https://nikkinikki.pages.dev/openwrt-25.12/aarch64_generic/nikki" >> repositories.conf
 
-          # B. 打包列表包含完整的 Nikki (Mihomo) 套件以及依赖的 nftables / tproxy 内核模块
+          # 打包列表：包含完整 Mihomo GUI、SmartDNS、FW4 内核级 TPROXY 依赖与工具链
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
