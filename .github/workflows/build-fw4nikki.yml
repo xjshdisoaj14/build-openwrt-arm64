@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Nikki/Mihomo + FW4)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Native Nikki/Mihomo + FW4)
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 3. 提取 ImageBuilder (25.12.1 / armsr/armv8)
+      # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
       - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
@@ -46,7 +46,40 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 集成 AdGuard Home 二进制 (ARM64)
+      # 4. 精准获取并集成 Nikki (Mihomo UI) 官方最新 Release 离线包
+      - name: Download & Integrate Nikki (Mihomo) Offline Packages
+        run: |
+          mkdir -p builder/packages
+          cd builder/packages
+
+          echo "==> 正在从 GitHub API 获取 Nikki 最新 Releases..."
+          RELEASE_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
+
+          # 匹配适合 aarch64 / armv8 架构的离线安装包
+          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)')
+
+          if [ -z "$DOWNLOAD_URLS" ]; then
+            echo "::warning:: 未在 Latest Release 中直接找到压缩包，尝试提取 Release Source/Assets..."
+            DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url')
+          fi
+
+          for URL in $DOWNLOAD_URLS; do
+            echo "正在下载 Nikki 组件: $URL"
+            curl -sSL -O "$URL"
+          done
+
+          # 如果下载到的是 .tar.gz 压缩包，则就地解压释放出内部的 apk/ipk 放置在 packages 目录
+          for TARBALL in *.tar.gz; do
+            if [ -f "$TARBALL" ]; then
+              tar -zxvf "$TARBALL"
+              rm -f "$TARBALL"
+            fi
+          done
+
+          echo "当前集成至 ImageBuilder 本地库的软件包列表："
+          ls -la
+
+      # 5. 集成 AdGuard Home 二进制 (ARM64)
       - name: Integrate AdGuard Home Binary
         run: |
           mkdir -p builder/files/opt
@@ -54,7 +87,7 @@ jobs:
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 5. 配置 AdGuard Home 服务自启动
+      # 6. 配置 AdGuard Home 服务自启动
       - name: Configure AdGuard Home Service
         run: |
           mkdir -p builder/files/etc/init.d
@@ -82,15 +115,13 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 配置 Nikki (Mihomo UI) 官方软件源并编译 RootFS
-      - name: Add Nikki Feed & Build RootFS
+      # 7. 打包 RootFS
+      - name: Build RootFS
         run: |
           cd builder
 
-          # 写入 Nikki 官方预编译包源，提供 nikki、mihomo 核心与中文语言包
-          echo "src/gz nikki https://nikkinikki.pages.dev/openwrt-25.12/aarch64_generic/nikki" >> repositories.conf
-
-          # 打包列表：包含完整 Mihomo GUI、SmartDNS、FW4 内核级 TPROXY 依赖与工具链
+          # 依赖分析：包含 FW4 内核级 TPROXY 依赖与工具链
+          # 配合 Step 4 离线拉取放入 packages 目录的本地 nikki 文件
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -107,7 +138,7 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 7. 上传 RootFS 编译产物
+      # 8. 上传 RootFS 编译产物
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
