@@ -13,40 +13,63 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链 (支持 xz 和 zstd)
+      # 2. 准备编译工具链 (确保支持 zstd 和 xz)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 3. 动态获取官方真实存在的最新的 Release 版本与 ImageBuilder URL (彻底杜绝 404)
+      # 3. 动态识别与抓取官方镜像（支持 armsr/armv8 与 armvirt/64 双重回溯，彻底解决 404）
       - name: Auto-Discover & Download ImageBuilder
         run: |
-          # 自动匹配官方 releases 页面中真实存在的最新稳定版
-          LATEST_VER=$(curl -sL "https://downloads.immortalwrt.org/releases/" | grep -oE '[0-9]{2}\.[0-9]{2}\.[0-9]+' | sort -V | tail -n 1)
-          
-          if [ -z "$LATEST_VER" ]; then
-            echo "Failed to auto-detect version, using verified fallback release 23.05.4"
-            LATEST_VER="23.05.4"
-          fi
+          BASE_URL="https://downloads.immortalwrt.org/releases"
 
-          echo "Detected Latest ImmortalWrt Version: ${LATEST_VER}"
-          BASE_URL="https://downloads.immortalwrt.org/releases/${LATEST_VER}/targets/armvirt/64/"
-          
-          # 动态匹配 Index 页面中真实存在的文件名 (.tar.xz 或 .tar.zst)
-          IB_FILENAME=$(curl -sL "$BASE_URL" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(xz|zst)' | head -n 1)
+          echo "==> 正在扫描 ImmortalWrt 官方所有 Stable Release 版本..."
+          VERSIONS=$(curl -sL "${BASE_URL}/" | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/"' | cut -d'"' -f2 | tr -d '/' | sort -V -r)
 
-          if [ -z "$IB_FILENAME" ]; then
-            echo "::error::ImageBuilder package not found under ${BASE_URL}"
+          FOUND_URL=""
+          SELECTED_VER=""
+          ARCH_TYPE=""
+
+          # 依次遍历各版本，优先检测新架构 armsr/armv8，次选旧架构 armvirt/64
+          for VER in $VERSIONS; do
+            for ARCH in "armsr/armv8" "armvirt/64"; do
+              TARGET_DIR="${BASE_URL}/${VER}/targets/${ARCH}"
+              echo "检查: Version ${VER} [${ARCH}]..."
+
+              # 抓取包含 imagebuilder 且后缀为 .tar.zst 或 .tar.xz 的真实文件名
+              IB_FILE=$(curl -sL "${TARGET_DIR}/" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+
+              if [ -n "$IB_FILE" ]; then
+                DOWNLOAD_URL="${TARGET_DIR}/${IB_FILE}"
+                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$DOWNLOAD_URL")
+                if [ "$HTTP_CODE" -eq 200 ]; then
+                  FOUND_URL="$DOWNLOAD_URL"
+                  SELECTED_VER="$VER"
+                  ARCH_TYPE="$ARCH"
+                  IB_FILENAME="$IB_FILE"
+                  break 2
+                fi
+              fi
+            done
+          done
+
+          if [ -z "$FOUND_URL" ]; then
+            echo "::error::未能在官方源找到有效的 ImageBuilder 下载包！"
             exit 1
           fi
 
-          FULL_URL="${BASE_URL}${IB_FILENAME}"
-          echo "Downloading ImageBuilder from: ${FULL_URL}"
+          echo "=============================================="
+          echo "成功找到可用镜像源:"
+          echo "版本: ${SELECTED_VER}"
+          echo "架构: ${ARCH_TYPE}"
+          echo "链接: ${FOUND_URL}"
+          echo "=============================================="
 
+          # 下载并解压
+          curl -sL "$FOUND_URL" -o ib_package.archive
           mkdir -p builder
-          curl -fL "$FULL_URL" -o ib_package.archive
 
           if [[ "$IB_FILENAME" == *.zst ]]; then
             tar --zstd -xf ib_package.archive -C builder --strip-components=1
@@ -91,16 +114,16 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 打包 RootFS（极致安全、隐蔽、快速、轻量的 Mihomo 生态组合）
+      # 6. 打包 RootFS（极致安全、隐蔽、快速、轻量的 Mihomo 原生 nftables 组合）
       - name: Build RootFS
         run: |
           cd builder
           
           # 【打包策略与架构优势】
-          # 1. 安全与隐蔽：luci-app-mihomo + mihomo 核心，完美支持 Hysteria 2 / VLESS-REALITY / TUIC v5 协议；
-          # 2. 快速与轻量：纯 nftables TPROXY 转发（kmod-nft-tproxy + kmod-nft-socket），规避 iptables 性能损耗；
-          # 3. SmartDNS + AdGuardHome 构建高并发防污染 DNS 链；
-          # 4. 精简 IPv6，降低系统开销与攻击面。
+          # 1. 隐蔽与安全：luci-app-mihomo 原生完美支持 Hysteria 2 / VLESS-REALITY / TUIC v5 / ShadowTLS 等抗封锁协议；
+          # 2. 快速与轻量：纯 nftables TPROXY 转发（kmod-nft-tproxy + kmod-nft-socket），彻底告别 iptables 兼容层性能损耗；
+          # 3. 高效 DNS 防污染：SmartDNS + AdGuardHome 构建高并发解析链；
+          # 4. 彻底屏蔽 IPv6 模块，减少网络攻击面与不必要的开销。
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -115,11 +138,11 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 7. 上传编译产物
+      # 7. 上传编译 RootFS 产物
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-mihomo-fw4-rootfs
-          path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
+          name: immortalwrt-mihomo-rootfs
+          path: builder/bin/targets/*/*/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
