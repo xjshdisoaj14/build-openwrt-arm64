@@ -1,0 +1,46 @@
+- name: Auto-Discover & Download ImageBuilder
+      run: |
+        TARGET_ARCH="armsr/armv8"
+        BASE_URL="https://downloads.immortalwrt.org/releases"
+
+        echo "==> Fetching released stable versions..."
+        # 1. 获取所有纯数字版本号并倒序排列 (排除 SNAPSHOT、rc 和 faillogs 等)
+        VERSIONS=$(curl -sL "${BASE_URL}/" | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/"' | cut -d'"' -f2 | tr -d '/' | sort -V -r)
+
+        FOUND_URL=""
+        SELECTED_VER=""
+
+        for VER in $VERSIONS; do
+          TARGET_DIR="${BASE_URL}/${VER}/targets/${TARGET_ARCH}"
+          echo "Checking version: ${VER} (${TARGET_DIR})..."
+
+          # 获取该目录下真实的 ImageBuilder tar.xz 文件名
+          IB_FILE=$(curl -sL "${TARGET_DIR}/" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.xz' | head -n 1)
+
+          if [ -n "$IB_FILE" ]; then
+            DOWNLOAD_URL="${TARGET_DIR}/${IB_FILE}"
+            # 校验链接有效性 (HTTP 200)
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$DOWNLOAD_URL")
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              FOUND_URL="$DOWNLOAD_URL"
+              SELECTED_VER="$VER"
+              break
+            fi
+          fi
+        done
+
+        if [ -z "$FOUND_URL" ]; then
+          echo "Error: Could not find any valid ImageBuilder for target ${TARGET_ARCH}"
+          exit 1
+        fi
+
+        echo "Detected Valid ImmortalWrt Version: ${SELECTED_VER}"
+        echo "Downloading: ${FOUND_URL}"
+
+        # 下载并解压
+        curl -sL "$FOUND_URL" -o imagebuilder.tar.xz
+        mkdir -p imagebuilder
+        tar -xf imagebuilder.tar.xz -C imagebuilder --strip-components=1
+        rm -f imagebuilder.tar.xz
+
+        echo "ImageBuilder successfully integrated!"
