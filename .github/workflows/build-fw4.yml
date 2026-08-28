@@ -20,13 +20,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 3. 直连目标地址提取 ImageBuilder（极速，免去漫长的遍历扫描）
+      # 3. 直连目标地址提取 ImageBuilder（极速，锁定 25.12.1 / armsr/armv8）
       - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
 
-          # 从页面中精准抓取包含 imagebuilder 且后缀为 tar.zst 或 tar.xz 的文件名
+          # 精准抓取包含 imagebuilder 的 tar.zst / tar.xz 文件名
           IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
@@ -83,22 +83,22 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 6. 执行镜像打包（适配 25.12.1 apk 包名的现代轻量组合）
+      # 6. 打包 RootFS（官方源收录的标准 HomeProxy / Sing-Box 纯原生 nftables 方案）
       - name: Build RootFS
         run: |
           cd builder
 
-          # 【25.12.1 软件打包调优说明】
-          # 1. 采用官方源标准收录的 nikki (Mihomo 核心) 与 luci-app-nikki，完美支持 Hysteria 2 / REALITY / TUIC v5；
-          # 2. 移除旧版的 luci-i18n-mihomo-zh-cn（25.12.1 的 apk 包已将语言整合包含在主包中）；
-          # 3. 开启 kmod-nft-tproxy + kmod-nft-socket，保障 FW4 环境下的内核级 UDP / QUIC 高吞吐；
-          # 4. 彻底禁用 IPv6 模块以减少系统资源损耗及安全隐患。
+          # 【25.12.1 极简高效打包策略】
+          # 1. luci-app-homeproxy：ImmortalWrt 官方原生代理组件，自动依赖 Sing-Box，完美支持 Hysteria 2 / REALITY；
+          # 2. kmod-nft-tproxy + kmod-nft-socket：FW4 下的内核级 TPROXY 转发，保障 QUIC / UDP 443 极速不掉包；
+          # 3. SmartDNS + AdGuardHome 防污染 DNS 组合；
+          # 4. 精简 IPv6，降低系统开销与攻击面。
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            nikki luci-app-nikki \
+            luci-app-homeproxy \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
