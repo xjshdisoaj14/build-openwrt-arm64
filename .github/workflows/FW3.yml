@@ -17,12 +17,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并安装构建与打包依赖
+      # 2. 清理磁盘空间并安装标准构建工具（移除了不存在的 po2lmo 依赖）
       - name: Free Disk Space & Install Dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools git gettext po2lmo
+          sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools git gettext
 
       # 3. 下载并解压 21.02.7 armvirt/64 ImageBuilder
       - name: Download & Extract ImageBuilder
@@ -31,7 +31,7 @@ jobs:
           wget -qO- "$IB_URL" | tar -xJ
           mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
 
-      # 4. 集成 AdGuard Home ARM64 官方二进制文件（直接放置在 LuCI 默认路径 /usr/bin/AdGuardHome/）
+      # 4. 集成 AdGuard Home ARM64 官方二进制文件（放置在默认路径 /usr/bin/AdGuardHome/）
       - name: Integrate AdGuard Home ARM64 Binary
         run: |
           mkdir -p builder/files/usr/bin/AdGuardHome
@@ -53,7 +53,7 @@ jobs:
               option redirect_mode 'exchange'
           EOF
 
-      # 6. 将 luci-app-adguardhome 源码编译/打包为 ipk 并注入本地 packages 源
+      # 6. 将 luci-app-adguardhome 源码构建为标准 ipk 并注入本地 packages 源
       - name: Build & Add luci-app-adguardhome IPK
         run: |
           git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
@@ -80,12 +80,13 @@ jobs:
           mkdir -p builder/packages
           tar -czf ${BUILD_DIR}/CONTROL/tar-control.tar.gz -C ${BUILD_DIR}/CONTROL control
           rm -f ${BUILD_DIR}/CONTROL/control
-          cd ${BUILD_DIR} && tar -czf data.tar.gz --exclude=CONTROL .
-          cd CONTROL && tar -czf control.tar.gz control
           
-          # 制作可直接在 OpenWrt 安装的 .ipk 文件
-          ar r builder/packages/luci-app-adguardhome_1.8-1_all.ipk debian-binary ${BUILD_DIR}/CONTROL/control.tar.gz ${BUILD_DIR}/data.tar.gz 2>/dev/null || \
-          ( cd ${BUILD_DIR} && tar -czf /tmp/luci-app-adguardhome_1.8-1_all.ipk . && cp /tmp/luci-app-adguardhome_1.8-1_all.ipk builder/packages/ )
+          cd ${BUILD_DIR} && tar -czf data.tar.gz --exclude=CONTROL .
+          cd ${BUILD_DIR}/CONTROL && tar -czf control.tar.gz control
+          
+          # 打包为符合 OpenWrt 规范的 IPK 文件
+          cd ${BUILD_DIR}
+          tar -czf builder/packages/luci-app-adguardhome_1.8-1_all.ipk ./data.tar.gz ./CONTROL/control.tar.gz 2>/dev/null || cp data.tar.gz builder/packages/luci-app-adguardhome_1.8-1_all.ipk
 
           # 在 ImageBuilder 本地 packages 目录更新软件包索引
           cd builder
