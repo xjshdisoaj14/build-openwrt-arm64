@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR Fast & FW4 Optimized)
+name: Build ImmortalWrt 25.12.1 (ARMSR + HomeProxy/Sing-Box + FW4)
 
 on:
   workflow_dispatch:
@@ -20,13 +20,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 3. 直连目标地址提取 ImageBuilder（极速，锁定 25.12.1 / armsr/armv8）
+      # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
       - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
 
-          # 精准抓取包含 imagebuilder 的 tar.zst / tar.xz 文件名
           IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
@@ -47,71 +46,35 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 集成 AdGuard Home 二进制 (ARM64)
-      - name: Integrate AdGuard Home Binary
-        run: |
-          mkdir -p builder/files/opt
-          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
-          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
-          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
-
-      # 5. 配置 AdGuard Home 服务自启动
-      - name: Configure AdGuard Home Service
-        run: |
-          mkdir -p builder/files/etc/init.d
-          cat << 'EOF' > builder/files/etc/init.d/adguardhome
-          #!/bin/sh /etc/rc.common
-
-          START=99
-          STOP=10
-
-          USE_PROCD=1
-          PROCD_DEBUG=1
-
-          PROG=/opt/AdGuardHome/AdGuardHome
-          WORK_DIR=/opt/AdGuardHome
-
-          start_service() {
-              procd_open_instance
-              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
-              procd_set_param respawn
-              procd_set_param stdout 1
-              procd_set_param stderr 1
-              procd_close_instance
-          }
-          EOF
-
-          chmod +x builder/files/etc/init.d/adguardhome
-
-      # 6. 打包 RootFS（官方源收录的标准 HomeProxy / Sing-Box 纯原生 nftables 方案）
+      # 4. 打包 RootFS (替换为 HomeProxy + Sing-Box)
       - name: Build RootFS
         run: |
           cd builder
 
-          # 【25.12.1 极简高效打包策略】
-          # 1. luci-app-homeproxy：ImmortalWrt 官方原生代理组件，自动依赖 Sing-Box，完美支持 Hysteria 2 / REALITY；
-          # 2. kmod-nft-tproxy + kmod-nft-socket：FW4 下的内核级 TPROXY 转发，保障 QUIC / UDP 443 极速不掉包；
-          # 3. SmartDNS + AdGuardHome 防污染 DNS 组合；
-          # 4. 精简 IPv6，降低系统开销与攻击面。
+          # 优化包列表：
+          # 1. 移除 AdGuard Home / SmartDNS / Nikki 及其繁琐依赖
+          # 2. 加入 sing-box 核心与 luci-app-homeproxy
+          # 3. 保留必要的 FW4 tproxy/tun 内核模块与基础工具
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
+            sing-box \
             luci-app-homeproxy \
-            luci-i18n-smartdns-zh-cn \
+            luci-i18n-homeproxy-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
-            curl wget-ssl ca-certificates \
-            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat"
+            curl wget-ssl ca-certificates ca-bundle \
+            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          make image PROFILE="" PACKAGES="$PACKAGES" -j$(nproc)
 
-      # 7. 上传 RootFS 编译产物
+      # 5. 上传 RootFS 编译产物
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-armsr-rootfs
+          name: immortalwrt-25.12.1-armsr-homeproxy-rootfs
           path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
