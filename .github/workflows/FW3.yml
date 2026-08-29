@@ -17,7 +17,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并安装标准构建工具（移除了不存在的 po2lmo 依赖）
+      # 2. 清理磁盘空间并安装标准构建工具
       - name: Free Disk Space & Install Dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
@@ -41,7 +41,34 @@ jobs:
           chmod +x builder/files/usr/bin/AdGuardHome/AdGuardHome
           rm -rf /tmp/AdGuardHome
 
-      # 5. 预设 UCI 默认配置（配置为默认路径与交换重定向模式）
+      # 5. 集成 luci-app-adguardhome 源码至 files 目录（含 init.d 服务与 LuCI 视图）
+      - name: Integrate luci-app-adguardhome Files
+        run: |
+          git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
+          
+          # 创建对应的文件系统路径
+          mkdir -p builder/files/etc/init.d
+          mkdir -p builder/files/etc/config
+          mkdir -p builder/files/usr/lib/lua/luci
+          mkdir -p builder/files/www
+          
+          # 提取 root 目录（包含 /etc/init.d/AdGuardHome 及 UCI 默认规则）
+          if [ -d /tmp/luci-app-adguardhome/root ]; then
+            cp -r /tmp/luci-app-adguardhome/root/* builder/files/
+          fi
+          
+          # 提取 Lua 控制界面与 Web 页面
+          if [ -d /tmp/luci-app-adguardhome/luasrc ]; then
+            cp -r /tmp/luci-app-adguardhome/luasrc/* builder/files/usr/lib/lua/luci/
+          fi
+          if [ -d /tmp/luci-app-adguardhome/htdocs ]; then
+            cp -r /tmp/luci-app-adguardhome/htdocs/* builder/files/www/
+          fi
+
+          # 确保 init.d 后台服务脚本拥有可执行权限
+          chmod +x builder/files/etc/init.d/* 2>/dev/null || true
+
+      # 6. 预设 UCI 默认配置（保证默认二进制路径与重定向正确）
       - name: Create Default AdGuard Home UCI Config
         run: |
           mkdir -p builder/files/etc/config
@@ -53,46 +80,7 @@ jobs:
               option redirect_mode 'exchange'
           EOF
 
-      # 6. 将 luci-app-adguardhome 源码构建为标准 ipk 并注入本地 packages 源
-      - name: Build & Add luci-app-adguardhome IPK
-        run: |
-          git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
-          
-          # 创建 IPK 结构目录
-          BUILD_DIR="/tmp/ipk_build"
-          mkdir -p ${BUILD_DIR}/CONTROL
-          
-          # 复制核心控制脚本、LuCI 视图、菜单和权限文件
-          [ -d /tmp/luci-app-adguardhome/root ] && cp -r /tmp/luci-app-adguardhome/root/* ${BUILD_DIR}/ || true
-          [ -d /tmp/luci-app-adguardhome/luasrc ] && mkdir -p ${BUILD_DIR}/usr/lib/lua/luci && cp -r /tmp/luci-app-adguardhome/luasrc/* ${BUILD_DIR}/usr/lib/lua/luci/ || true
-          [ -d /tmp/luci-app-adguardhome/htdocs ] && cp -r /tmp/luci-app-adguardhome/htdocs/* ${BUILD_DIR}/www/ || true
-          
-          # 建立标准 control 文件
-          cat << 'EOF' > ${BUILD_DIR}/CONTROL/control
-          Package: luci-app-adguardhome
-          Version: 1.8-1
-          Architecture: all
-          Maintainer: rufengsuixing
-          Description: LuCI support for AdGuard Home
-          EOF
-
-          # 构建 IPK 安装包
-          mkdir -p builder/packages
-          tar -czf ${BUILD_DIR}/CONTROL/tar-control.tar.gz -C ${BUILD_DIR}/CONTROL control
-          rm -f ${BUILD_DIR}/CONTROL/control
-          
-          cd ${BUILD_DIR} && tar -czf data.tar.gz --exclude=CONTROL .
-          cd ${BUILD_DIR}/CONTROL && tar -czf control.tar.gz control
-          
-          # 打包为符合 OpenWrt 规范的 IPK 文件
-          cd ${BUILD_DIR}
-          tar -czf builder/packages/luci-app-adguardhome_1.8-1_all.ipk ./data.tar.gz ./CONTROL/control.tar.gz 2>/dev/null || cp data.tar.gz builder/packages/luci-app-adguardhome_1.8-1_all.ipk
-
-          # 在 ImageBuilder 本地 packages 目录更新软件包索引
-          cd builder
-          make package_index PATH=packages
-
-      # 7. 执行打包 (在 PACKAGES 中显式加入 luci-app-adguardhome)
+      # 7. 执行打包（无需在 PACKAGES 中显式填入 luci-app-adguardhome，所有文件已直接塞入系统）
       - name: Build RootFS
         run: |
           cd builder
@@ -106,7 +94,6 @@ jobs:
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
-            luci-app-adguardhome \
             curl wget-ssl ca-certificates iptables iptables-mod-tproxy"
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
