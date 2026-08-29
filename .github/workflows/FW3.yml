@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 21.02.7 (FW3 - Fixed)
+name: Build ImmortalWrt 21.02.7 (FW3)
 
 on:
   workflow_dispatch:
@@ -17,12 +17,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并补全所有构建依赖
+      # 2. 清理磁盘空间并安装构建与打包依赖
       - name: Free Disk Space & Install Dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools git gettext
+          sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools git gettext po2lmo
 
       # 3. 下载并解压 21.02.7 armvirt/64 ImageBuilder
       - name: Download & Extract ImageBuilder
@@ -31,51 +31,67 @@ jobs:
           wget -qO- "$IB_URL" | tar -xJ
           mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
 
-      # 4. 集成 AdGuard Home ARM64 二进制文件
+      # 4. 集成 AdGuard Home ARM64 官方二进制文件（直接放置在 LuCI 默认路径 /usr/bin/AdGuardHome/）
       - name: Integrate AdGuard Home ARM64 Binary
         run: |
-          mkdir -p builder/files/opt
+          mkdir -p builder/files/usr/bin/AdGuardHome
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/${ADGUARD_VER}/AdGuardHome_linux_arm64.tar.gz"
-          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
-          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
+          curl -sSL "$AGH_URL" | tar -zx -C /tmp
+          mv /tmp/AdGuardHome/AdGuardHome builder/files/usr/bin/AdGuardHome/AdGuardHome
+          chmod +x builder/files/usr/bin/AdGuardHome/AdGuardHome
+          rm -rf /tmp/AdGuardHome
 
-      # 5. 集成 LuCI UI 界面并配置 UCI 预设（由 LuCI 插件全权接管服务生命周期）
-      - name: Integrate LuCI UI for AdGuard Home
+      # 5. 预设 UCI 默认配置（配置为默认路径与交换重定向模式）
+      - name: Create Default AdGuard Home UCI Config
         run: |
-          git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
-          
-          # 创建必要的目录结构
-          mkdir -p builder/files/usr/lib/lua/luci
-          mkdir -p builder/files/www/luci-static/resources/view
-          mkdir -p builder/files/usr/share/luci/menu.d
-          mkdir -p builder/files/usr/share/rpcd/acl.d
           mkdir -p builder/files/etc/config
-          mkdir -p builder/files/etc/uci-defaults
-
-          # 兼容复制 Lua 目录（若存在）
-          [ -d /tmp/luci-app-adguardhome/luasrc ] && cp -r /tmp/luci-app-adguardhome/luasrc/* builder/files/usr/lib/lua/luci/ || true
-          
-          # 兼容复制 JavaScript 目录（若存在）
-          [ -d /tmp/luci-app-adguardhome/htdocs/luci-static/resources ] && cp -r /tmp/luci-app-adguardhome/htdocs/luci-static/resources/* builder/files/www/luci-static/resources/ || true
-          
-          # 复制菜单与 ACL 权限控制文件
-          [ -d /tmp/luci-app-adguardhome/root/usr/share/luci/menu.d ] && cp -r /tmp/luci-app-adguardhome/root/usr/share/luci/menu.d/* builder/files/usr/share/luci/menu.d/ || true
-          [ -d /tmp/luci-app-adguardhome/root/usr/share/rpcd/acl.d ] && cp -r /tmp/luci-app-adguardhome/root/usr/share/rpcd/acl.d/* builder/files/usr/share/rpcd/acl.d/ || true
-          
-          # 复制默认配置
-          [ -d /tmp/luci-app-adguardhome/root/etc/config ] && cp -r /tmp/luci-app-adguardhome/root/etc/config/* builder/files/etc/config/ || true
-          [ -d /tmp/luci-app-adguardhome/root/etc/uci-defaults ] && cp -r /tmp/luci-app-adguardhome/root/etc/uci-defaults/* builder/files/etc/uci-defaults/ || true
-
-          # 预设 UCI 配置文件：开启服务、正确指向路径并开启端口交换重定向
           cat << 'EOF' > builder/files/etc/config/adguardhome
           config adguardhome 'config'
               option enabled '1'
-              option binpath '/opt/AdGuardHome/AdGuardHome'
-              option workpath '/opt/AdGuardHome'
+              option binpath '/usr/bin/AdGuardHome/AdGuardHome'
+              option workpath '/usr/bin/AdGuardHome'
               option redirect_mode 'exchange'
           EOF
 
-      # 6. 执行打包
+      # 6. 将 luci-app-adguardhome 源码编译/打包为 ipk 并注入本地 packages 源
+      - name: Build & Add luci-app-adguardhome IPK
+        run: |
+          git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
+          
+          # 创建 IPK 结构目录
+          BUILD_DIR="/tmp/ipk_build"
+          mkdir -p ${BUILD_DIR}/CONTROL
+          
+          # 复制核心控制脚本、LuCI 视图、菜单和权限文件
+          [ -d /tmp/luci-app-adguardhome/root ] && cp -r /tmp/luci-app-adguardhome/root/* ${BUILD_DIR}/ || true
+          [ -d /tmp/luci-app-adguardhome/luasrc ] && mkdir -p ${BUILD_DIR}/usr/lib/lua/luci && cp -r /tmp/luci-app-adguardhome/luasrc/* ${BUILD_DIR}/usr/lib/lua/luci/ || true
+          [ -d /tmp/luci-app-adguardhome/htdocs ] && cp -r /tmp/luci-app-adguardhome/htdocs/* ${BUILD_DIR}/www/ || true
+          
+          # 建立标准 control 文件
+          cat << 'EOF' > ${BUILD_DIR}/CONTROL/control
+          Package: luci-app-adguardhome
+          Version: 1.8-1
+          Architecture: all
+          Maintainer: rufengsuixing
+          Description: LuCI support for AdGuard Home
+          EOF
+
+          # 构建 IPK 安装包
+          mkdir -p builder/packages
+          tar -czf ${BUILD_DIR}/CONTROL/tar-control.tar.gz -C ${BUILD_DIR}/CONTROL control
+          rm -f ${BUILD_DIR}/CONTROL/control
+          cd ${BUILD_DIR} && tar -czf data.tar.gz --exclude=CONTROL .
+          cd CONTROL && tar -czf control.tar.gz control
+          
+          # 制作可直接在 OpenWrt 安装的 .ipk 文件
+          ar r builder/packages/luci-app-adguardhome_1.8-1_all.ipk debian-binary ${BUILD_DIR}/CONTROL/control.tar.gz ${BUILD_DIR}/data.tar.gz 2>/dev/null || \
+          ( cd ${BUILD_DIR} && tar -czf /tmp/luci-app-adguardhome_1.8-1_all.ipk . && cp /tmp/luci-app-adguardhome_1.8-1_all.ipk builder/packages/ )
+
+          # 在 ImageBuilder 本地 packages 目录更新软件包索引
+          cd builder
+          make package_index PATH=packages
+
+      # 7. 执行打包 (在 PACKAGES 中显式加入 luci-app-adguardhome)
       - name: Build RootFS
         run: |
           cd builder
@@ -89,11 +105,12 @@ jobs:
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
+            luci-app-adguardhome \
             curl wget-ssl ca-certificates iptables iptables-mod-tproxy"
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 7. 上传 RootFS 归档包供 Docker 使用
+      # 8. 上传 RootFS 归档包供 Docker 使用
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
