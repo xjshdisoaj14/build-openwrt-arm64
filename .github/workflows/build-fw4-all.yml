@@ -69,7 +69,7 @@ jobs:
             fi
           done
 
-      # 5. 集成 daed 二进制（增强匹配与精准提取）
+      # 5. 集成 daed 二进制
       - name: Integrate daed Binary
         run: |
           mkdir -p builder/files/usr/bin
@@ -116,7 +116,7 @@ jobs:
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 7. 配置后台服务自启动 (使用 printf 方案确保 100% 换行无误)
+      # 7. 配置后台服务自启动 (使用 printf 保证 100% 格式安全)
       - name: Configure System Services Init Scripts
         run: |
           mkdir -p builder/files/etc/init.d
@@ -169,33 +169,35 @@ jobs:
         run: |
           cd builder
 
-          # 建立本地临时包索引（适配 25.x APK 机制）
-          if [ -d "packages" ] && [ "$(ls -A packages)" ]; then
-            if command -v apk >/dev/null 2>&1; then
-              apk index -o packages/packages.adb packages/*.apk 2>/dev/null || true
-            fi
+          # 动态匹配 packages 目录下载入的第三方本地 .apk / .ipk 包完整路径
+          LOCAL_PACKAGES=""
+          if [ -d "packages" ]; then
+            for PKG in packages/*.apk packages/*.ipk; do
+              if [ -f "$PKG" ]; then
+                LOCAL_PACKAGES="$LOCAL_PACKAGES $PKG"
+              fi
+            done
           fi
 
-          # 软件包清单（包含 Mihomo / Nikki / Mosdns / dae 运行依赖）
-          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+          # 精简并修正后的包列表
+          BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             mihomo \
             nikki \
-            luci-app-nikki \
-            luci-i18n-nikki-zh-cn \
             mosdns \
-            luci-app-mosdns \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq \
-            clang llvm bpftool kmod-ikconfig"
+            bpftool kmod-ikconfig"
 
-          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          ALL_PACKAGES="$BASE_PACKAGES $LOCAL_PACKAGES"
+
+          make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" -j$(nproc)
 
       # 9. 上传 RootFS 编译产物
       - name: Upload RootFS Artifact
