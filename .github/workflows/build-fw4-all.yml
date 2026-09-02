@@ -1,12 +1,17 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Full Proxy Suite + HTTPS/TLS)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Full Proxy & HTTPS)
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   build:
     name: Build ImmortalWrt RootFS
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       # 1. 拉取仓库代码
@@ -16,19 +21,17 @@ jobs:
       # 2. 准备编译工具链
       - name: Prepare Build Tools
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-          export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update -o Acquire::http::Timeout="10" -o Acquire::ftp::Timeout="10"
-          sudo apt-get install -y --no-install-recommends \
-            make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules
+          sudo apt-get update
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 3. 下载并解压 ImageBuilder (25.12.1 / armsr/armv8)
+      # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
       - name: Download & Extract ImageBuilder
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
 
-          IB_FILE=$(curl --connect-timeout 10 --retry 3 -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
             echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
@@ -38,7 +41,7 @@ jobs:
           DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
           echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
 
-          curl --connect-timeout 15 --retry 3 -sL "$DOWNLOAD_URL" -o ib_package.archive
+          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
 
           if [[ "$IB_FILE" == *.zst ]]; then
@@ -48,183 +51,115 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 下载 Nikki 离线包并配置 APK 信任公钥
-      - name: Download & Integrate Nikki Packages
+      # 4. 集成外部核心应用 APK 离线包 (Nikki, Mihomo, Daed, MosDNS)
+      - name: Download & Integrate Custom APK Packages
         run: |
-          # 创建本地离线包存放路径与系统密钥路径
           mkdir -p builder/packages
-          mkdir -p builder/files/etc/apk/keys/
-          mkdir -p builder/keys
-
           cd builder/packages
 
-          echo "==> 获取 Nikki 最新 Release..."
-          RELEASE_JSON=$(curl --connect-timeout 10 --retry 3 -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
-          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.pub)' || true)
+          # Helper 函数：从 GitHub Releases 抓取符合条件的 apk 资源
+          fetch_github_apk() {
+            local repo=$1
+            local pattern=$2
+            echo "==> 正在从 $repo 抓取最新 Releases..."
+            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url' | grep -E "$pattern" | grep -E '\.apk$')
+            
+            for url in $urls; do
+              echo "Downloading: $url"
+              curl -sSL -O "$url"
+            done
+          }
 
-          for URL in $DOWNLOAD_URLS; do
-            echo "下载资源: $URL"
-            if [[ "$URL" == *.pub ]]; then
-              curl --connect-timeout 10 --retry 3 -sSL "$URL" -o "../files/etc/apk/keys/$(basename $URL)"
-              cp -f "../files/etc/apk/keys/$(basename $URL)" "../keys/" 2>/dev/null || true
-            else
-              curl --connect-timeout 10 --retry 3 -sSL -O "$URL"
+          # 1) Nikki APKs
+          fetch_github_apk "nikkinikki-org/OpenWrt-nikki" "(aarch64|arm64|all)"
+
+          # 2) MosDNS APKs (LuCI & Core)
+          fetch_github_apk "sbwml/luci-app-mosdns" "(aarch64|arm64|all)"
+
+          # 如果抓取到压缩包则自动解压释放出 .apk 文件
+          for archive in *.tar.gz *.zip; do
+            if [ -f "$archive" ]; then
+              echo "Unpacking $archive ..."
+              tar -zxvf "$archive" 2>/dev/null || unzip -o "$archive" 2>/dev/null || true
+              rm -f "$archive"
             fi
           done
 
-          # 解压所有的压缩包
-          for TARBALL in *.tar.gz *.zip; do
-            if [ -f "$TARBALL" ]; then
-              tar -zxvf "$TARBALL" 2>/dev/null || unzip -o "$TARBALL" 2>/dev/null || true
-              rm -f "$TARBALL"
-            fi
-          done
+          echo "当前集成至 ImageBuilder 本地库的离线 APK 列表："
+          ls -la *.apk 2>/dev/null || echo "未找到额外的本地 .apk 文件，将依赖官方软件源安装"
 
-          # 剔除冲突包与旧 IPK 格式文件
-          rm -f *.ipk
-          rm -f base-files*.apk kernel*.apk libc*.apk mihomo*.apk
-
-          echo "==> 过滤后的本地组件："
-          ls -la *.apk || true
-
-      # 5. 集成 daed 二进制
-      - name: Integrate daed Binary
-        run: |
-          mkdir -p builder/files/usr/bin
-          mkdir -p builder/files/etc/daed
-
-          echo "==> 获取 daed 最新 Release 并提取 ARM64 二进制..."
-          DAED_JSON=$(curl --connect-timeout 10 --retry 3 -sL https://api.github.com/repos/daeuniverse/daed/releases/latest)
-          DAED_URL=$(echo "$DAED_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -iE '(arm64|aarch64)' | grep -iE '\.(tar\.gz|zip|gz)$' | head -n 1 || true)
-
-          if [ -z "$DAED_URL" ]; then
-            echo "::warning:: 未在 API 中动态匹配到资源，使用备用路径..."
-            DAED_URL="https://github.com/daeuniverse/daed/releases/download/v0.8.0/daed-linux-arm64.zip"
-          fi
-
-          echo "正在下载 daed: $DAED_URL"
-          curl --connect-timeout 15 --retry 3 -sSL "$DAED_URL" -o daed_download_file
-
-          mkdir -p daed_tmp
-          if unzip -t daed_download_file >/dev/null 2>&1; then
-            unzip -o daed_download_file -d daed_tmp/
-          elif tar -ztf daed_download_file >/dev/null 2>&1; then
-            tar -zxvf daed_download_file -C daed_tmp/
-          else
-            cp daed_download_file daed_tmp/daed
-          fi
-
-          DAED_BIN=$(find daed_tmp/ -type f -name "daed" | head -n 1)
-          if [ -n "$DAED_BIN" ]; then
-            cp -f "$DAED_BIN" builder/files/usr/bin/daed
-            chmod +x builder/files/usr/bin/daed
-            echo "daed 二进制集成成功！"
-          else
-            echo "::error:: 未能成功解析并提取 daed 二进制文件！"
-            exit 1
-          fi
-          rm -rf daed_download_file daed_tmp
-
-      # 6. 集成 AdGuard Home 二进制
+      # 5. 集成 AdGuard Home 二进制 (ARM64)
       - name: Integrate AdGuard Home Binary
         run: |
           mkdir -p builder/files/opt
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
-          curl --connect-timeout 15 --retry 3 -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
+          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 7. 配置后台服务 Init 脚本
-      - name: Configure System Services Init Scripts
+      # 6. 配置自启动服务 (AdGuard Home 及基础 SSL/HTTPS 优化)
+      - name: Configure System Files & Services
         run: |
+          # AdGuardHome init 脚本
           mkdir -p builder/files/etc/init.d
+          cat << 'EOF' > builder/files/etc/init.d/adguardhome
+          #!/bin/sh /etc/rc.common
 
-          # 1. AdGuardHome 服务脚本
-          printf '%s\n' \
-            '#!/bin/sh /etc/rc.common' \
-            '' \
-            'START=99' \
-            'STOP=10' \
-            '' \
-            'USE_PROCD=1' \
-            'PROCD_DEBUG=1' \
-            '' \
-            'PROG=/opt/AdGuardHome/AdGuardHome' \
-            'WORK_DIR=/opt/AdGuardHome' \
-            '' \
-            'start_service() {' \
-            '    procd_open_instance' \
-            '    procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR' \
-            '    procd_set_param respawn' \
-            '    procd_set_param stdout 1' \
-            '    procd_set_param stderr 1' \
-            '    procd_close_instance' \
-            '}' > builder/files/etc/init.d/adguardhome
+          START=99
+          STOP=10
+          USE_PROCD=1
+          PROCD_DEBUG=1
 
+          PROG=/opt/AdGuardHome/AdGuardHome
+          WORK_DIR=/opt/AdGuardHome
+
+          start_service() {
+              procd_open_instance
+              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
+              procd_set_param respawn
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+          EOF
           chmod +x builder/files/etc/init.d/adguardhome
 
-          # 2. daed 服务脚本
-          printf '%s\n' \
-            '#!/bin/sh /etc/rc.common' \
-            '' \
-            'START=95' \
-            'STOP=15' \
-            '' \
-            'USE_PROCD=1' \
-            'PROG=/usr/bin/daed' \
-            '' \
-            'start_service() {' \
-            '    procd_open_instance' \
-            '    procd_set_param command $PROG run -c /etc/daed' \
-            '    procd_set_param respawn' \
-            '    procd_set_param stdout 1' \
-            '    procd_set_param stderr 1' \
-            '    procd_close_instance' \
-            '}' > builder/files/etc/init.d/daed
+          # UHTTPD HTTPS 默认启用的目录准备
+          mkdir -p builder/files/etc/ssl/mycerts
 
-          chmod +x builder/files/etc/init.d/daed
-
-      # 8. 打包 RootFS
+      # 7. 打包 RootFS (针对 25.12.1 FW4 与 APK 架构精简和增强)
       - name: Build RootFS
         run: |
           cd builder
 
-          # 提取下载好的本地第三方 apk 包名称（不含目录前缀）
-          LOCAL_PACKAGES=""
-          if [ -d "packages" ]; then
-            for PKG in packages/*.apk; do
-              if [ -f "$PKG" ]; then
-                # 获取包完整名称并追加到列表中
-                LOCAL_PACKAGES="$LOCAL_PACKAGES $(basename $PKG .apk)"
-              fi
-            done
-          fi
+          # 基础与网络增强
+          BASE_PKGS="luci luci-i18n-base-zh-cn luci-theme-argon vsftpd openssh-sftp-server curl wget-ssl ca-certificates certifi zlib"
 
-          BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
-            luci \
-            luci-ssl \
-            openssl-util \
-            ca-bundle \
-            ca-certificates \
-            luci-i18n-base-zh-cn \
-            luci-theme-argon \
-            vsftpd openssh-sftp-server \
-            mosdns \
-            luci-i18n-smartdns-zh-cn \
-            luci-app-vlmcsd \
-            luci-i18n-softethervpn-zh-cn \
-            curl wget-ssl \
-            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq \
-            bpftool kmod-ikconfig"
+          # HTTPS & ACME 证书管理工具链
+          HTTPS_PKGS="luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone uhttpd-mod-ubus"
 
-          ALL_PACKAGES="$BASE_PACKAGES $LOCAL_PACKAGES"
+          # 防火墙4 (FW4 / NFTables) 及转发内核依赖
+          FW4_PKGS="nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          # 通过环境变量绕过 APK 签名拦截
-          export APK_FLAGS="--allow-untrusted"
-          export APK_OPTS="--allow-untrusted"
+          # 透明代理与 DNS 核心应用组件 (Mihomo, Nikki, Daed, MosDNS)
+          APP_PKGS="nikki luci-app-nikki luci-i18n-nikki-zh-cn \
+                    mihomo luci-app-mihomo luci-i18n-mihomo-zh-cn \
+                    daed luci-app-daed luci-i18n-daed-zh-cn \
+                    mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
+                    luci-i18n-smartdns-zh-cn luci-app-vlmcsd luci-i18n-softethervpn-zh-cn"
 
-          make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" APK_OPTS="--allow-untrusted" -j$(nproc)
+          # 移除精简项
+          REMOVE_PKGS="-odhcp6c -odhcpd-ipv6only -kmod-ipv6"
 
-      # 9. 上传 RootFS 编译产物
+          # 组合完整软件包清单
+          PACKAGES="$REMOVE_PKGS $BASE_PKGS $HTTPS_PKGS $FW4_PKGS $APP_PKGS"
+
+          echo "开始打包，最终选定的 PACKAGES 列表："
+          echo "$PACKAGES"
+
+          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+
+      # 8. 上传 RootFS 编译产物到 Actions Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -232,3 +167,23 @@ jobs:
           path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
+
+      # 9. 自动生成 Release Tag 并发布到 GitHub Release
+      - name: Create & Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        with:
+          tag_name: ImmortalWrt-25.12.1-${{ github.run_id }}
+          name: ImmortalWrt 25.12.1 RootFS (ARMSR + Proxy Suite)
+          body: |
+            ## ImmortalWrt 25.12.1 自动构建产物
+            - **架构**: ARMSR / armv8
+            - **包管理器**: APK (OpenWrt 25.x 架构)
+            - **防火墙**: Firewall4 (nftables)
+            - **内置核心功能**:
+              - 代理组件: Nikki, Mihomo, Daed
+              - DNS 分流: MosDNS, SmartDNS, AdGuard Home
+              - 自动化安全: SSL / HTTPS (ACME Certs)
+          files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
