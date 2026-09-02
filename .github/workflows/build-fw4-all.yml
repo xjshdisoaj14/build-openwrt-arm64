@@ -1,10 +1,7 @@
-name: Build ImmortalWrt 25.12.1 (ARM64/ARMSR + Nikki + MosDNS)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite + HTTPS)
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
 jobs:
   build:
@@ -18,15 +15,15 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链
+      # 2. 准备编译工具链 (支持 zstd 与 xz)
       - name: Prepare Build Tools
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
       # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
-      - name: Download & Extract ImageBuilder
+      - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
@@ -51,57 +48,58 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 精准下载并集成 ARM64 / aarch64 第三方 APK 包 (Nikki / MosDNS)
-      - name: Download Third-party APK Packages (ARM64/aarch64)
+      # 4. 精准获取并集成第三方离线包 (Nikki + MosDNS + Daed)
+      # 维持你原有的结构，只扩充拉取源，自动下载并解压 apk 到 builder/packages
+      - name: Download & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
           cd builder/packages
 
-          # 1) 获取 Nikki 最新 Release 的所有资源，全面覆盖 arm64/aarch64/all 的 apk
-          echo "==> 正在获取 Nikki (ARM64) 组件..."
-          NIKKI_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
-          NIKKI_URLS=$(echo "$NIKKI_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all)' | grep -E '\.apk$')
+          # 通用拉取函数：匹配 aarch64/arm64/all 的 apk 或压缩包
+          download_latest_assets() {
+            local repo=$1
+            echo "==> 正在获取 $repo 的最新 Releases..."
+            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)')
+            for url in $urls; do
+              echo "正在下载: $url"
+              curl -sSL -O "$url"
+            done
+          }
 
-          for url in $NIKKI_URLS; do
-            echo "下载 Nikki APK: $url"
-            curl -sSL -O "$url"
-          done
+          # 1) Nikki (内置 Mihomo 核心)
+          download_latest_assets "nikkinikki-org/OpenWrt-nikki"
 
-          # 2) 获取 sbwml MosDNS 最新 Release (支持 aarch64_generic / arm64)
-          echo "==> 正在获取 MosDNS (ARM64) 组件..."
-          MOSDNS_JSON=$(curl -sL https://api.github.com/repos/sbwml/luci-app-mosdns/releases/latest)
-          MOSDNS_URLS=$(echo "$MOSDNS_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all)' | grep -E '\.apk$')
+          # 2) MosDNS (sbwml 维护版本)
+          download_latest_assets "sbwml/luci-app-mosdns"
 
-          for url in $MOSDNS_URLS; do
-            echo "下载 MosDNS APK: $url"
-            curl -sSL -O "$url"
-          done
+          # 3) Daed (dae UI)
+          download_latest_assets "daed-project/daed-openwrt" || true
 
-          # 3) 如果下载到的包含 tar.gz 或 zip（部分第三方以压缩包形式发布），解压释放 apk
+          # 处理解压：遇到 tar.gz / zip 压缩包，解压后提取 apk 放置于 packages 根目录
           for archive in *.tar.gz *.zip; do
             if [ -f "$archive" ]; then
-              echo "正在解压压缩包: $archive"
               tar -zxvf "$archive" 2>/dev/null || unzip -o "$archive" 2>/dev/null || true
               rm -f "$archive"
             fi
           done
 
-          # 把子目录中的 apk 移动到 root package 目录下，确保 ImageBuilder 能扫描到
+          # 确保解压到子目录里的 .apk 文件全部挪到 packages 根目录供 ImageBuilder 扫描
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
-          echo "==> 成功导入 ImageBuilder 本地库的 ARM64 APK 列表："
+          echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
           ls -la *.apk || true
 
       # 5. 集成 AdGuard Home 二进制 (ARM64)
-      - name: Integrate AdGuard Home Binary (ARM64)
+      - name: Integrate AdGuard Home Binary
         run: |
           mkdir -p builder/files/opt
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 6. 配置 AdGuard Home 服务自启动与 HTTPS 目录
-      - name: Configure System Files
+      # 6. 配置 AdGuard Home 服务自启动
+      - name: Configure AdGuard Home Service
         run: |
           mkdir -p builder/files/etc/init.d
           cat << 'EOF' > builder/files/etc/init.d/adguardhome
@@ -109,6 +107,7 @@ jobs:
 
 START=99
 STOP=10
+
 USE_PROCD=1
 PROCD_DEBUG=1
 
@@ -125,61 +124,57 @@ start_service() {
 }
 EOF
           chmod +x builder/files/etc/init.d/adguardhome
-          mkdir -p builder/files/etc/ssl/mycerts
 
-      # 7. 构建 RootFS (ARM64 / ARMSR 针对 OpenWrt 25.x 核心优化)
+      # 7. 打包 RootFS
       - name: Build RootFS
         run: |
           cd builder
 
-          # 基础系统组件
-          BASE_PKGS="luci luci-i18n-base-zh-cn luci-theme-argon vsftpd openssh-sftp-server curl wget-ssl ca-certificates zlib"
-
-          # HTTPS & ACME 自动证书工具
-          HTTPS_PKGS="luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone uhttpd-mod-ubus"
-
-          # FW4 (nftables) 转发与透明代理内核驱动 (ARM64)
-          FW4_PKGS="nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
-
-          # 第三方应用包 (包含已下载到本地 packages 目录的 apk 项)
-          APP_PKGS="nikki luci-app-nikki luci-i18n-nikki-zh-cn \
-                    mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-                    luci-i18n-smartdns-zh-cn luci-app-vlmcsd luci-i18n-softethervpn-zh-cn"
-
-          # 移除精简项
-          REMOVE_PKGS="-odhcp6c -odhcpd-ipv6only -kmod-ipv6"
-
-          PACKAGES="$REMOVE_PKGS $BASE_PKGS $HTTPS_PKGS $FW4_PKGS $APP_PKGS"
-
-          echo "开始执行 ImageBuilder 打包，最终选定的 PACKAGES 列表："
-          echo "$PACKAGES"
+          # 补充说明：
+          # 1. Nikki 已自带 Mihomo 核心，无需单独写 mihomo 包；
+          # 2. 增加 HTTPS/ACME 自动化证书工具包 (luci-app-acme, openssl-util 等)；
+          # 3. 补全 MosDNS / Daed / Nikki 对应的标准包名。
+          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+            luci \
+            luci-i18n-base-zh-cn \
+            luci-theme-argon \
+            vsftpd openssh-sftp-server \
+            nikki luci-app-nikki luci-i18n-nikki-zh-cn \
+            mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
+            daed luci-app-daed \
+            luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone \
+            luci-i18n-smartdns-zh-cn \
+            luci-app-vlmcsd \
+            luci-i18n-softethervpn-zh-cn \
+            curl wget-ssl ca-certificates \
+            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 编译产物到 Actions Artifacts
+      # 8. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-arm64-rootfs
+          name: immortalwrt-25.12.1-armsr-rootfs
           path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 9. 自动发布 RootFS 包到 GitHub Release
-      - name: Create & Upload to GitHub Release
+      # 9. 发布编译产物到 GitHub Releases
+      - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: ImmortalWrt-25.12.1-arm64-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 RootFS (ARM64/ARMSR)
+          tag_name: ImmortalWrt-25.12.1-${{ github.run_id }}
+          name: ImmortalWrt 25.12.1 ARMSR RootFS
           body: |
-            ## ImmortalWrt 25.12.1 ARM64 自动构建产物
-            - **架构**: ARMSR / armv8 (ARM64)
-            - **包管理器**: APK (OpenWrt 25.x 架构)
-            - **核心集成**:
-              - 代理及 DNS: Nikki (Mihomo 内核), MosDNS, SmartDNS, AdGuard Home
-              - 防火墙: Firewall4 (nftables + kmod-nft-tproxy)
-              - 安全防护: HTTPS / ACME 自动证书工具链
+            ## ImmortalWrt 25.12.1 (ARMSR / armv8) 自动构建
+            - **架构 / 包管理器**: ARMSR (ARM64) / APK
+            - **内置组件**: 
+              - Nikki (Mihomo 核心)
+              - MosDNS & AdGuard Home
+              - Daed 代理前端
+              - HTTPS / ACME 自动化证书工具链
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
