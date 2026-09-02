@@ -69,7 +69,7 @@ jobs:
             fi
           done
 
-      # 5. 集成 daed 二进制
+# 5. 集成 daed 二进制
       - name: Integrate daed Binary
         run: |
           mkdir -p builder/files/usr/bin
@@ -77,16 +77,32 @@ jobs:
 
           echo "==> 获取 daed 最新 Release 并提取 ARM64 二进制..."
           DAED_JSON=$(curl -sL https://api.github.com/repos/daeuniverse/daed/releases/latest)
-          DAED_URL=$(echo "$DAED_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -iE 'linux-arm64|aarch64' | head -n 1 || true)
+          DAED_URL=$(echo "$DAED_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -iE 'arm64|aarch64' | grep -iE '\.tar\.gz|\.zip' | head -n 1 || true)
 
-          if [ -n "$DAED_URL" ]; then
-            curl -sSL "$DAED_URL" -o daed.tar.gz
-            tar -zxvf daed.tar.gz -C builder/files/usr/bin/ 2>/dev/null || true
-            chmod +x builder/files/usr/bin/daed 2>/dev/null || true
-            rm -f daed.tar.gz
-          else
-            echo "::warning:: 未找到 daed 对应架构的 Release 资源包！"
+          if [ -z "$DAED_URL" ]; then
+            # 备用方案：直接拉取最新稳定版的直连地址
+            DAED_URL="https://github.com/daeuniverse/daed/releases/download/v0.8.0/daed-linux-arm64.tar.gz"
           fi
+
+          echo "正在下载 daed: $DAED_URL"
+          curl -sSL "$DAED_URL" -o daed.archive
+          
+          if [[ "$DAED_URL" == *.zip ]]; then
+            unzip -o daed.archive -d daed_tmp/
+          else
+            mkdir -p daed_tmp && tar -zxvf daed.archive -C daed_tmp/
+          fi
+
+          # 查找并移动二进制文件
+          DAED_BIN=$(find daed_tmp/ -type f -name "daed" | head -n 1)
+          if [ -n "$DAED_BIN" ]; then
+            cp -f "$DAED_BIN" builder/files/usr/bin/daed
+            chmod +x builder/files/usr/bin/daed
+            echo "daed 二进制集成成功！"
+          else
+            echo "::error:: 未能从解压包中提取到 daed 执行文件！"
+          fi
+          rm -rf daed.archive daed_tmp
 
       # 6. 集成 AdGuard Home 二进制
       - name: Integrate AdGuard Home Binary
@@ -170,7 +186,6 @@ jobs:
             luci-i18n-nikki-zh-cn \
             mosdns \
             luci-app-mosdns \
-            luci-i18n-mosdns-zh-cn \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
