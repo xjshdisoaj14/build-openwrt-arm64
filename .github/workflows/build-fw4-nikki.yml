@@ -149,9 +149,9 @@ jobs:
 
       - name: 自动创建 Release 并上传固件
         uses: softprops/action-gh-release@v2
-        if: steps.compile.outcome == 'success' && !cancelled() # 确保编译成功时才执行
+        if: ${{ !cancelled() }}
         with:
-         tag_name: ImmortalWrt_${{ env.BUILD_DATE }} # 自动生成版本标签（需在前面步骤定义 BUILD_DATE 变量，也可以写死如 v1.0.0）
+          tag_name: ImmortalWrt_${{ env.BUILD_DATE }}
           name: ImmortalWrt 固件发布 - ${{ env.BUILD_DATE }}
           body: |
             ### 编译信息
