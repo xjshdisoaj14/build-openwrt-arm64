@@ -46,22 +46,22 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 集成 Nikki (Mihomo UI) & Mihomo 内核离线包
-      - name: Download & Integrate Nikki & Mihomo Packages
+      # 4. 集成 Nikki (Mihomo UI) 离线安装包
+      - name: Download & Integrate Nikki Packages
         run: |
           mkdir -p builder/packages
           cd builder/packages
 
-          echo "==> 正在从 GitHub API 获取 Nikki 最新 Release..."
+          echo "==> 正在获取 Nikki 最新 Releases..."
           RELEASE_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
-          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)')
+          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
 
           for URL in $DOWNLOAD_URLS; do
             echo "下载 Nikki 组件: $URL"
             curl -sSL -O "$URL"
           done
 
-          # 自动解压包含的压缩包
+          # 自动解压下载到的压缩包文件
           for TARBALL in *.tar.gz *.zip; do
             if [ -f "$TARBALL" ]; then
               tar -zxvf "$TARBALL" 2>/dev/null || unzip -o "$TARBALL" 2>/dev/null || true
@@ -69,7 +69,7 @@ jobs:
             fi
           done
 
-      # 5. 集成 dae / daed (ARM64) 环境与二进制
+      # 5. 集成 daed 二进制
       - name: Integrate daed Binary
         run: |
           mkdir -p builder/files/usr/bin
@@ -77,18 +77,18 @@ jobs:
 
           echo "==> 获取 daed 最新 Release 并提取 ARM64 二进制..."
           DAED_JSON=$(curl -sL https://api.github.com/repos/daeuniverse/daed/releases/latest)
-          DAED_URL=$(echo "$DAED_JSON" | jq -r '.assets[].browser_download_url' | grep -iE 'linux-arm64|aarch64' | head -n 1)
+          DAED_URL=$(echo "$DAED_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -iE 'linux-arm64|aarch64' | head -n 1 || true)
 
           if [ -n "$DAED_URL" ]; then
             curl -sSL "$DAED_URL" -o daed.tar.gz
-            tar -zxvf daed.tar.gz -C builder/files/usr/bin/ 2>/dev/null || tar -zxvf daed.tar.gz builder/files/usr/bin/
+            tar -zxvf daed.tar.gz -C builder/files/usr/bin/ 2>/dev/null || true
             chmod +x builder/files/usr/bin/daed 2>/dev/null || true
             rm -f daed.tar.gz
           else
             echo "::warning:: 未找到 daed 对应架构的 Release 资源包！"
           fi
 
-      # 6. 集成 AdGuard Home 二进制 (ARM64)
+      # 6. 集成 AdGuard Home 二进制
       - name: Integrate AdGuard Home Binary
         run: |
           mkdir -p builder/files/opt
@@ -101,7 +101,7 @@ jobs:
         run: |
           mkdir -p builder/files/etc/init.d
 
-          # AdGuard Home 服务
+          # 创建 AdGuardHome 服务
           cat << 'EOF' > builder/files/etc/init.d/adguardhome
 #!/bin/sh /etc/rc.common
 
@@ -125,7 +125,7 @@ start_service() {
 EOF
           chmod +x builder/files/etc/init.d/adguardhome
 
-          # daed 服务
+          # 创建 daed 服务
           cat << 'EOF' > builder/files/etc/init.d/daed
 #!/bin/sh /etc/rc.common
 
@@ -151,15 +151,14 @@ EOF
         run: |
           cd builder
 
-          # 建立本地临时 APK/IPK 索引仓库，防止打包时忽略 local packages
+          # 建立本地临时包索引（适配 25.x APK / 23.x IPK 双架构）
           if [ -d "packages" ] && [ "$(ls -A packages)" ]; then
             if command -v apk >/dev/null 2>&1; then
-              echo "正在为 25.x 生成 apk 索引..."
               apk index -o packages/packages.adb packages/*.apk 2>/dev/null || true
             fi
           fi
 
-          # 详细组件打包列表（包含 eBPF, FW4 tproxy, Mosdns, Mihomo, Nikki, dae 依赖）
+          # 软件包清单（整合 Mihomo / Mosdns / Nikki / dae依赖）
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
