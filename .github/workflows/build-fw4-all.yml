@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链 (优化网络与超时控制)
+      # 2. 准备编译工具链
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
@@ -48,20 +48,29 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 集成 Nikki (Mihomo UI) 离线安装包 (精细筛选)
+      # 4. 集成 Nikki 离线包并导入信任公钥
       - name: Download & Integrate Nikki Packages
         run: |
           mkdir -p builder/packages
+          mkdir -p builder/etc/apk/keys/
           cd builder/packages
 
-          echo "==> 正在获取 Nikki 最新 Releases..."
+          echo "==> 获取 Nikki 最新 Release..."
           RELEASE_JSON=$(curl --connect-timeout 10 --retry 3 -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
-          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk)' || true)
+          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.pub)' || true)
 
           for URL in $DOWNLOAD_URLS; do
-            echo "下载 Nikki 组件: $URL"
-            curl --connect-timeout 10 --retry 3 -sSL -O "$URL"
+            echo "下载资源: $URL"
+            if [[ "$URL" == *.pub ]]; then
+              curl --connect-timeout 10 --retry 3 -sSL "$URL" -o "../etc/apk/keys/$(basename $URL)"
+            else
+              curl --connect-timeout 10 --retry 3 -sSL -O "$URL"
+            fi
           done
+
+          # 如果 Release Asset 中没包含 .pub 秘钥，直接从公网源补充下载 Nikki 签名公钥
+          curl --connect-timeout 10 --retry 3 -sSL "https://github.com/nikkinikki-org/OpenWrt-nikki/raw/main/nikki.pub" \
+            -o "../etc/apk/keys/nikki.pub" 2>/dev/null || true
 
           # 解压所有的压缩包
           for TARBALL in *.tar.gz *.zip; do
@@ -71,12 +80,14 @@ jobs:
             fi
           done
 
-          # 清理非 .apk 文件以及系统重名冲突包
+          # 剔除冲突包与旧 IPK 格式文件
           rm -f *.ipk
           rm -f base-files*.apk kernel*.apk libc*.apk mihomo*.apk
 
-          echo "==> 过滤后的本地有效组件包："
+          echo "==> 过滤后的本地组件："
           ls -la *.apk || true
+          echo "==> 当前信任的公钥库："
+          ls -la ../etc/apk/keys/ || true
 
       # 5. 集成 daed 二进制
       - name: Integrate daed Binary
@@ -176,12 +187,12 @@ jobs:
 
           chmod +x builder/files/etc/init.d/daed
 
-      # 8. 打包 RootFS (增加 HTTPS/SSL 软件包)
+      # 8. 打包 RootFS (允许未授权本地包环境)
       - name: Build RootFS
         run: |
           cd builder
 
-          # 动态获取已过滤好的第三方本地 .apk 包
+          # 动态获取本地第三方 .apk 包
           LOCAL_PACKAGES=""
           if [ -d "packages" ]; then
             for PKG in packages/*.apk; do
@@ -191,7 +202,6 @@ jobs:
             done
           fi
 
-          # 包含了 HTTPS/SSL 支持的完整包列表
           BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-ssl \
@@ -210,6 +220,9 @@ jobs:
             bpftool kmod-ikconfig"
 
           ALL_PACKAGES="$BASE_PACKAGES $LOCAL_PACKAGES"
+
+          # 导出环境变量强制允许安装未信任标记的本地第三方包
+          export APK_FLAGS="--allow-untrusted"
 
           make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" -j$(nproc)
 
