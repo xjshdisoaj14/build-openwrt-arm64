@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链 (支持 zstd 与 xz)
+      # 2. 准备编译工具链
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
@@ -46,7 +46,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 集成 Nikki (Mihomo UI) 离线安装包
+      # 4. 集成 Nikki (Mihomo UI) 离线安装包 (精细筛选)
       - name: Download & Integrate Nikki Packages
         run: |
           mkdir -p builder/packages
@@ -54,20 +54,27 @@ jobs:
 
           echo "==> 正在获取 Nikki 最新 Releases..."
           RELEASE_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
-          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
+          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk)' || true)
 
           for URL in $DOWNLOAD_URLS; do
             echo "下载 Nikki 组件: $URL"
             curl -sSL -O "$URL"
           done
 
-          # 自动解压下载到的压缩包文件
+          # 解压所有的压缩包
           for TARBALL in *.tar.gz *.zip; do
             if [ -f "$TARBALL" ]; then
               tar -zxvf "$TARBALL" 2>/dev/null || unzip -o "$TARBALL" 2>/dev/null || true
               rm -f "$TARBALL"
             fi
           done
+
+          # 清理非 .apk 文件以及系统重名冲突包 (base-files, kernel, libc 等)
+          rm -f *.ipk
+          rm -f base-files*.apk kernel*.apk libc*.apk mihomo*.apk
+
+          echo "==> 过滤后的本地有效组件包："
+          ls -la *.apk || true
 
       # 5. 集成 daed 二进制
       - name: Integrate daed Binary
@@ -116,7 +123,7 @@ jobs:
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 7. 配置后台服务自启动 (使用 printf 保证 100% 格式安全)
+      # 7. 配置后台服务自启动
       - name: Configure System Services Init Scripts
         run: |
           mkdir -p builder/files/etc/init.d
@@ -169,24 +176,21 @@ jobs:
         run: |
           cd builder
 
-          # 动态匹配 packages 目录下载入的第三方本地 .apk / .ipk 包完整路径
+          # 动态获取已过滤好的第三方本地 .apk 包
           LOCAL_PACKAGES=""
           if [ -d "packages" ]; then
-            for PKG in packages/*.apk packages/*.ipk; do
+            for PKG in packages/*.apk; do
               if [ -f "$PKG" ]; then
                 LOCAL_PACKAGES="$LOCAL_PACKAGES $PKG"
               fi
             done
           fi
 
-          # 精简并修正后的包列表
           BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            mihomo \
-            nikki \
             mosdns \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
