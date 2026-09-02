@@ -51,7 +51,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 5. 精准获取并集成 Nikki (Mihomo UI) 官方最新 Release 离线包
+# 5. 精准获取并集成 Nikki (Mihomo UI) 官方最新 Release 离线包
       - name: Download & Integrate Nikki (Mihomo) Offline Packages
         run: |
           mkdir -p builder/packages
@@ -60,20 +60,14 @@ jobs:
           echo "==> 正在从 GitHub API 获取 Nikki 最新 Releases..."
           RELEASE_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
 
-          # 匹配适合 aarch64 / armv8 架构的离线安装包
-          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
-
-          if [ -z "$DOWNLOAD_URLS" ]; then
-            echo "::warning:: 未在 Latest Release 中直接找到特定架构包，尝试提取所有 Release Assets..."
-            DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty')
-          fi
+          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty')
 
           for URL in $DOWNLOAD_URLS; do
             echo "正在下载 Nikki 组件: $URL"
             curl -sSL -O "$URL"
           done
 
-          # 如果下载到的是 .tar.gz 或 .zip 压缩包，则就地解压释放出内部文件放置在 packages 目录
+          # 解压可能存在的 tar.gz 或 zip 压缩包
           for TARBALL in *.tar.gz *.zip; do
             if [ -f "$TARBALL" ]; then
               tar -zxvf "$TARBALL" 2>/dev/null || unzip -o "$TARBALL" 2>/dev/null || true
@@ -81,7 +75,10 @@ jobs:
             fi
           done
 
-          echo "当前集成至 ImageBuilder 本地库的软件包列表："
+          # 【关键修正】移除解压/下载过程中混入的官方基础系统包，避免 apk 签名冲突报错
+          rm -f base-files*.apk kernel*.apk libc*.apk
+
+          echo "清理冲突包后，当前留在本地库的 Nikki 组件："
           ls -la
 
       # 6. 集成 AdGuard Home 二进制 (ARM64)
@@ -143,17 +140,9 @@ jobs:
         run: |
           cd builder
 
-          # 动态获取已过滤好的第三方本地 .apk 包
-          LOCAL_PACKAGES=""
-          if [ -d "packages" ]; then
-            for PKG in packages/*.apk; do
-              if [ -f "$PKG" ]; then
-                LOCAL_PACKAGES="$LOCAL_PACKAGES $PKG"
-              fi
-            done
-          fi
-
-          BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+          # 构建包列表：明确移除 uhttpd-mod-ubox，添加 luci-ssl-uhttpd
+          # 仅让 ImageBuilder 根据本地 index 自动安装依赖包
+          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
@@ -169,10 +158,7 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          ALL_PACKAGES="$BASE_PACKAGES $LOCAL_PACKAGES"
-
-          make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" -j$(nproc)
-
+          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
       # 9. 搜集并整理固件产物
       - name: Organize Artifacts
         run: |
