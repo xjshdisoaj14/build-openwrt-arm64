@@ -187,12 +187,18 @@ jobs:
 
           chmod +x builder/files/etc/init.d/daed
 
-      # 8. 打包 RootFS (允许未授权本地包环境)
+# 8. 打包 RootFS (允许未授权本地包环境)
       - name: Build RootFS
         run: |
           cd builder
 
-          # 动态获取本地第三方 .apk 包
+          # 1. 拷贝本地第三方 apk 密钥（如果有）
+          mkdir -p repositories/keys/
+          if [ -d "etc/apk/keys" ]; then
+            cp -f etc/apk/keys/* repositories/keys/ 2>/dev/null || true
+          fi
+
+          # 2. 收集本地包路径
           LOCAL_PACKAGES=""
           if [ -d "packages" ]; then
             for PKG in packages/*.apk; do
@@ -221,10 +227,8 @@ jobs:
 
           ALL_PACKAGES="$BASE_PACKAGES $LOCAL_PACKAGES"
 
-          # 导出环境变量强制允许安装未信任标记的本地第三方包
-          export APK_FLAGS="--allow-untrusted"
-
-          make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" -j$(nproc)
+          # 3. 关键修复：通过 APK_OPTS 向底层传递全局忽略签名验证参数
+          make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" APK_OPTS="--allow-untrusted" -j$(nproc)
 
       # 9. 上传 RootFS 编译产物
       - name: Upload RootFS Artifact
