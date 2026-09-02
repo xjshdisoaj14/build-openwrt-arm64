@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Native Nikki/Mihomo + FW4 + HTTPS)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Native Nikki/Mihomo + FW4)
 
 on:
   workflow_dispatch:
@@ -13,19 +13,14 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 生成当前构建时间变量 (用于 Release Tag)
-      - name: Generate Build Date
-        run: |
-          echo "BUILD_DATE=$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_ENV
-
-      # 3. 准备编译工具链 (支持 zstd, xz, jq)
+      # 2. 准备编译工具链 (支持 zstd 与 xz)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 4. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
+      # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
       - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
@@ -51,45 +46,40 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 5. 精准提取并清洗 Nikki (Mihomo UI) 离线包 (彻底剔除非 ARM64 架构)
-      - name: Download & Clean Nikki (Mihomo) Packages
+      # 4. 精准获取并集成 Nikki (Mihomo UI) 官方最新 Release 离线包
+      - name: Download & Integrate Nikki (Mihomo) Offline Packages
         run: |
           mkdir -p builder/packages
           cd builder/packages
 
-          echo "==> 从 GitHub API 获取 Nikki 最新 Releases..."
+          echo "==> 正在从 GitHub API 获取 Nikki 最新 Releases..."
           RELEASE_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
-          ALL_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty')
 
-          for URL in $ALL_URLS; do
-            FILE_NAME=$(basename "$URL")
-            # 过滤掉文件名明确标注为非 ARM64 的压缩包或 apk
-            if echo "$FILE_NAME" | grep -iqE '(x86|amd64|i386|mips|mipsel|riscv|loongarch|armv7)'; then
-              echo "跳过非目标架构文件: $FILE_NAME"
-            else
-              echo "下载离线组件: $URL"
-              curl -sSL -O "$URL"
+          # 匹配适合 aarch64 / armv8 架构的离线安装包
+          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)')
+
+          if [ -z "$DOWNLOAD_URLS" ]; then
+            echo "::warning:: 未在 Latest Release 中直接找到压缩包，尝试提取 Release Source/Assets..."
+            DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url')
+          fi
+
+          for URL in $DOWNLOAD_URLS; do
+            echo "正在下载 Nikki 组件: $URL"
+            curl -sSL -O "$URL"
+          done
+
+          # 如果下载到的是 .tar.gz 压缩包，则就地解压释放出内部的 apk/ipk 放置在 packages 目录
+          for TARBALL in *.tar.gz; do
+            if [ -f "$TARBALL" ]; then
+              tar -zxvf "$TARBALL"
+              rm -f "$TARBALL"
             fi
           done
 
-          # 解压可能下载到的 tar.gz 或 zip 合集包
-          for ARCHIVE in *.tar.gz *.zip; do
-            if [ -f "$ARCHIVE" ]; then
-              echo "正在解压合集文件: $ARCHIVE"
-              tar -zxvf "$ARCHIVE" 2>/dev/null || unzip -o "$ARCHIVE" 2>/dev/null || true
-              rm -f "$ARCHIVE"
-            fi
-          done
-
-          # 【核心防御】物理扫荡：强行删除解压出来的所有非 aarch64/arm64/all 架构的 apk，以及混入的系统基础包
-          echo "==> 清理非 aarch64 架构及冲突的核心基础包..."
-          find . -type f -name "*.apk" ! -name "*aarch64*" ! -name "*arm64*" ! -name "*_all.apk" -exec rm -f {} +
-          rm -f base-files*.apk kernel*.apk libc*.apk
-
-          echo "==> 最终保留在 ImageBuilder 本地仓库的合法组件："
+          echo "当前集成至 ImageBuilder 本地库的软件包列表："
           ls -la
 
-      # 6. 集成 AdGuard Home 二进制 (ARM64)
+      # 5. 集成 AdGuard Home 二进制 (ARM64)
       - name: Integrate AdGuard Home Binary
         run: |
           mkdir -p builder/files/opt
@@ -97,13 +87,10 @@ jobs:
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 7. 配置后台服务自启动与 HTTPS 初始化配置
-      - name: Configure System Services Init Scripts
+      # 6. 配置 AdGuard Home 服务自启动
+      - name: Configure AdGuard Home Service
         run: |
           mkdir -p builder/files/etc/init.d
-          mkdir -p builder/files/etc/uci-defaults
-
-          # 配置 AdGuard Home 启动脚本
           cat << 'EOF' > builder/files/etc/init.d/adguardhome
           #!/bin/sh /etc/rc.common
 
@@ -125,34 +112,20 @@ jobs:
               procd_close_instance
           }
           EOF
+
           chmod +x builder/files/etc/init.d/adguardhome
 
-          # 配置 uhttpd 启用 HTTPS 重定向
-          cat << 'EOF' > builder/files/etc/uci-defaults/99-enable-https
-          #!/bin/sh
-          uci del_list uhttpd.main.listen_https="0.0.0.0:443" 2>/dev/null
-          uci del_list uhttpd.main.listen_https="[::]:443" 2>/dev/null
-          uci add_list uhttpd.main.listen_https="0.0.0.0:443"
-          uci add_list uhttpd.main.listen_https="[::]:443"
-          uci set uhttpd.main.redirect_https="1"
-          uci commit uhttpd
-          exit 0
-          EOF
-          chmod +x builder/files/etc/uci-defaults/99-enable-https
-
-      # 8. 打包 RootFS (适应 ImmortalWrt 25.12 apk 体系)
+      # 7. 打包 RootFS
       - name: Build RootFS
         run: |
           cd builder
 
-          # 包列表说明：
-          # 1. 采用 luci-ssl 替代旧版虚包
-          # 2. 保留完整的 FW4 与 透明代理依赖项 (kmod-nft-tproxy, kmod-tun 等)
+          # 依赖分析：包含 FW4 内核级 TPROXY 依赖与工具链
+          # 配合 Step 4 离线拉取放入 packages 目录的本地 nikki 文件
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
-            luci-ssl \
             vsftpd openssh-sftp-server \
             nikki \
             luci-app-nikki \
@@ -165,28 +138,11 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 9. 搜集并整理固件产物
-      - name: Organize Artifacts
-        run: |
-          mkdir -p release_files
-          find builder/bin/targets/ -type f \( -name "*rootfs*" -o -name "*.tar.gz" -o -name "*.img.gz" -o -name "*.iso" \) -exec cp {} release_files/ \; 2>/dev/null || true
-          echo "==== 收集准备上传至 Release 的文件列表 ===="
-          ls -la release_files/
-
-      # 10. 上传 RootFS 编译产物至 Release
-      - name: Create Release & Upload Firmware
-        uses: softprops/action-gh-release@v2
-        if: ${{ !cancelled() }}
+      # 8. 上传 RootFS 编译产物
+      - name: Upload RootFS Artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ImmortalWrt_${{ env.BUILD_DATE }}
-          name: ImmortalWrt 固件发布 - ${{ env.BUILD_DATE }}
-          body: |
-            ### 编译信息
-            - **架构**: armsr / armv8 (aarch64)
-            - **构建时间**: ${{ env.BUILD_DATE }}
-            - **核心组件**: Nikki (Mihomo), AdGuard Home, FW4, HTTPS (luci-ssl)
-          draft: false
-          prerelease: false
-          files: release_files/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: immortalwrt-25.12.1-armsr-rootfs
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+          if-no-files-found: error
+          retention-days: 7
