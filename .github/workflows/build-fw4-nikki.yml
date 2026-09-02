@@ -146,3 +146,23 @@ jobs:
           path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
+
+      - name: 自动创建 Release 并上传固件
+        uses: softprops/action-gh-release@v2
+        if: steps.compile.outcome == 'success' && !cancelled() # 确保编译成功时才执行
+        with:
+         tag_name: ImmortalWrt_${{ env.BUILD_DATE }} # 自动生成版本标签（需在前面步骤定义 BUILD_DATE 变量，也可以写死如 v1.0.0）
+          name: ImmortalWrt 固件发布 - ${{ env.BUILD_DATE }}
+          body: |
+            ### 编译信息
+            - **内核版本**: OpenWrt / ImmortalWrt
+            - **构建时间**: ${{ env.BUILD_DATE }}
+            - **包含组件**: Fullcone NAT, TurboACC 等
+          draft: false
+          prerelease: false
+          files: |
+            openwrt/bin/targets/*/*/*.bin
+            openwrt/bin/targets/*/*/*.img.gz
+            openwrt/bin/targets/*/*/*sysupgrade.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
