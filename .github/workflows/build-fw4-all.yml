@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Full Proxy & HTTPS)
+name: Build ImmortalWrt 25.12.1 (ARM64/ARMSR + Nikki + MosDNS)
 
 on:
   workflow_dispatch:
@@ -51,110 +51,107 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 集成外部核心应用 APK 离线包 (Nikki, Mihomo, Daed, MosDNS)
-      - name: Download & Integrate Custom APK Packages
+      # 4. 精准下载并集成 ARM64 / aarch64 第三方 APK 包 (Nikki / MosDNS)
+      - name: Download Third-party APK Packages (ARM64/aarch64)
         run: |
           mkdir -p builder/packages
           cd builder/packages
 
-          # Helper 函数：从 GitHub Releases 抓取符合条件的 apk 资源
-          fetch_github_apk() {
-            local repo=$1
-            local pattern=$2
-            echo "==> 正在从 $repo 抓取最新 Releases..."
-            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
-            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url' | grep -E "$pattern" | grep -E '\.apk$')
-            
-            for url in $urls; do
-              echo "Downloading: $url"
-              curl -sSL -O "$url"
-            done
-          }
+          # 1) 获取 Nikki 最新 Release 的所有资源，全面覆盖 arm64/aarch64/all 的 apk
+          echo "==> 正在获取 Nikki (ARM64) 组件..."
+          NIKKI_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
+          NIKKI_URLS=$(echo "$NIKKI_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all)' | grep -E '\.apk$')
 
-          # 1) Nikki APKs
-          fetch_github_apk "nikkinikki-org/OpenWrt-nikki" "(aarch64|arm64|all)"
+          for url in $NIKKI_URLS; do
+            echo "下载 Nikki APK: $url"
+            curl -sSL -O "$url"
+          done
 
-          # 2) MosDNS APKs (LuCI & Core)
-          fetch_github_apk "sbwml/luci-app-mosdns" "(aarch64|arm64|all)"
+          # 2) 获取 sbwml MosDNS 最新 Release (支持 aarch64_generic / arm64)
+          echo "==> 正在获取 MosDNS (ARM64) 组件..."
+          MOSDNS_JSON=$(curl -sL https://api.github.com/repos/sbwml/luci-app-mosdns/releases/latest)
+          MOSDNS_URLS=$(echo "$MOSDNS_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all)' | grep -E '\.apk$')
 
-          # 如果抓取到压缩包则自动解压释放出 .apk 文件
+          for url in $MOSDNS_URLS; do
+            echo "下载 MosDNS APK: $url"
+            curl -sSL -O "$url"
+          done
+
+          # 3) 如果下载到的包含 tar.gz 或 zip（部分第三方以压缩包形式发布），解压释放 apk
           for archive in *.tar.gz *.zip; do
             if [ -f "$archive" ]; then
-              echo "Unpacking $archive ..."
+              echo "正在解压压缩包: $archive"
               tar -zxvf "$archive" 2>/dev/null || unzip -o "$archive" 2>/dev/null || true
               rm -f "$archive"
             fi
           done
 
-          echo "当前集成至 ImageBuilder 本地库的离线 APK 列表："
-          ls -la *.apk 2>/dev/null || echo "未找到额外的本地 .apk 文件，将依赖官方软件源安装"
+          # 把子目录中的 apk 移动到 root package 目录下，确保 ImageBuilder 能扫描到
+          find . -mindepth 2 -name "*.apk" -exec mv {} . \;
+
+          echo "==> 成功导入 ImageBuilder 本地库的 ARM64 APK 列表："
+          ls -la *.apk || true
 
       # 5. 集成 AdGuard Home 二进制 (ARM64)
-      - name: Integrate AdGuard Home Binary
+      - name: Integrate AdGuard Home Binary (ARM64)
         run: |
           mkdir -p builder/files/opt
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
           curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 6. 配置自启动服务 (AdGuard Home 及基础 SSL/HTTPS 优化)
-      - name: Configure System Files & Services
+      # 6. 配置 AdGuard Home 服务自启动与 HTTPS 目录
+      - name: Configure System Files
         run: |
-          # AdGuardHome init 脚本
           mkdir -p builder/files/etc/init.d
           cat << 'EOF' > builder/files/etc/init.d/adguardhome
-          #!/bin/sh /etc/rc.common
+#!/bin/sh /etc/rc.common
 
-          START=99
-          STOP=10
-          USE_PROCD=1
-          PROCD_DEBUG=1
+START=99
+STOP=10
+USE_PROCD=1
+PROCD_DEBUG=1
 
-          PROG=/opt/AdGuardHome/AdGuardHome
-          WORK_DIR=/opt/AdGuardHome
+PROG=/opt/AdGuardHome/AdGuardHome
+WORK_DIR=/opt/AdGuardHome
 
-          start_service() {
-              procd_open_instance
-              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
-              procd_set_param respawn
-              procd_set_param stdout 1
-              procd_set_param stderr 1
-              procd_close_instance
-          }
-          EOF
+start_service() {
+    procd_open_instance
+    procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+EOF
           chmod +x builder/files/etc/init.d/adguardhome
-
-          # UHTTPD HTTPS 默认启用的目录准备
           mkdir -p builder/files/etc/ssl/mycerts
 
-      # 7. 打包 RootFS (针对 25.12.1 FW4 与 APK 架构精简和增强)
+      # 7. 构建 RootFS (ARM64 / ARMSR 针对 OpenWrt 25.x 核心优化)
       - name: Build RootFS
         run: |
           cd builder
 
-          # 基础与网络增强
-          BASE_PKGS="luci luci-i18n-base-zh-cn luci-theme-argon vsftpd openssh-sftp-server curl wget-ssl ca-certificates certifi zlib"
+          # 基础系统组件
+          BASE_PKGS="luci luci-i18n-base-zh-cn luci-theme-argon vsftpd openssh-sftp-server curl wget-ssl ca-certificates zlib"
 
-          # HTTPS & ACME 证书管理工具链
+          # HTTPS & ACME 自动证书工具
           HTTPS_PKGS="luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone uhttpd-mod-ubus"
 
-          # 防火墙4 (FW4 / NFTables) 及转发内核依赖
+          # FW4 (nftables) 转发与透明代理内核驱动 (ARM64)
           FW4_PKGS="nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          # 透明代理与 DNS 核心应用组件 (Mihomo, Nikki, Daed, MosDNS)
+          # 第三方应用包 (包含已下载到本地 packages 目录的 apk 项)
           APP_PKGS="nikki luci-app-nikki luci-i18n-nikki-zh-cn \
-                    mihomo luci-app-mihomo luci-i18n-mihomo-zh-cn \
-                    daed luci-app-daed luci-i18n-daed-zh-cn \
                     mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
                     luci-i18n-smartdns-zh-cn luci-app-vlmcsd luci-i18n-softethervpn-zh-cn"
 
           # 移除精简项
           REMOVE_PKGS="-odhcp6c -odhcpd-ipv6only -kmod-ipv6"
 
-          # 组合完整软件包清单
           PACKAGES="$REMOVE_PKGS $BASE_PKGS $HTTPS_PKGS $FW4_PKGS $APP_PKGS"
 
-          echo "开始打包，最终选定的 PACKAGES 列表："
+          echo "开始执行 ImageBuilder 打包，最终选定的 PACKAGES 列表："
           echo "$PACKAGES"
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
@@ -163,27 +160,26 @@ jobs:
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-armsr-rootfs
+          name: immortalwrt-25.12.1-arm64-rootfs
           path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 9. 自动生成 Release Tag 并发布到 GitHub Release
+      # 9. 自动发布 RootFS 包到 GitHub Release
       - name: Create & Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: ImmortalWrt-25.12.1-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 RootFS (ARMSR + Proxy Suite)
+          tag_name: ImmortalWrt-25.12.1-arm64-${{ github.run_id }}
+          name: ImmortalWrt 25.12.1 RootFS (ARM64/ARMSR)
           body: |
-            ## ImmortalWrt 25.12.1 自动构建产物
-            - **架构**: ARMSR / armv8
+            ## ImmortalWrt 25.12.1 ARM64 自动构建产物
+            - **架构**: ARMSR / armv8 (ARM64)
             - **包管理器**: APK (OpenWrt 25.x 架构)
-            - **防火墙**: Firewall4 (nftables)
-            - **内置核心功能**:
-              - 代理组件: Nikki, Mihomo, Daed
-              - DNS 分流: MosDNS, SmartDNS, AdGuard Home
-              - 自动化安全: SSL / HTTPS (ACME Certs)
+            - **核心集成**:
+              - 代理及 DNS: Nikki (Mihomo 内核), MosDNS, SmartDNS, AdGuard Home
+              - 防火墙: Firewall4 (nftables + kmod-nft-tproxy)
+              - 安全防护: HTTPS / ACME 自动证书工具链
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
