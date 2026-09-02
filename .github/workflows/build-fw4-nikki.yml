@@ -123,6 +123,7 @@ jobs:
           chmod +x builder/files/etc/init.d/adguardhome
 
           # 配置 uhttpd 支持 443 端口并自动重定向 HTTP 到 HTTPS
+          # 配置 uhttpd 支持 443 端口并自动重定向 HTTP 到 HTTPS
           cat << 'EOF' > builder/files/etc/uci-defaults/99-enable-https
           #!/bin/sh
           uci del_list uhttpd.main.listen_https="0.0.0.0:443" 2>/dev/null
@@ -130,23 +131,34 @@ jobs:
           uci add_list uhttpd.main.listen_https="0.0.0.0:443"
           uci add_list uhttpd.main.listen_https="[::]:443"
           uci set uhttpd.main.redirect_https="1"
+          uci set uhttpd.main.cert="/etc/uhttpd.crt"
+          uci set uhttpd.main.key="/etc/uhttpd.key"
           uci commit uhttpd
           exit 0
           EOF
           chmod +x builder/files/etc/uci-defaults/99-enable-https
 
-      # 8. 打包 RootFS
+# 8. 打包 RootFS
       - name: Build RootFS
         run: |
           cd builder
 
-          # 依赖分析：包含 FW4 内核级 TPROXY 依赖、HTTPS (uhttpd-mod-ubox/px5g-standalone) 与工具链
-          # 配合 Step 5 离线拉取放入 packages 目录的本地 nikki 文件
-          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+          # 动态获取已过滤好的第三方本地 .apk 包
+          LOCAL_PACKAGES=""
+          if [ -d "packages" ]; then
+            for PKG in packages/*.apk; do
+              if [ -f "$PKG" ]; then
+                LOCAL_PACKAGES="$LOCAL_PACKAGES $PKG"
+              fi
+            done
+          fi
+
+          BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
-            uhttpd-mod-ubox px5g-standalone \
+            luci-ssl-uhttpd \
+            px5g-standalone \
             vsftpd openssh-sftp-server \
             nikki \
             luci-app-nikki \
@@ -157,7 +169,9 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          ALL_PACKAGES="$BASE_PACKAGES $LOCAL_PACKAGES"
+
+          make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" -j$(nproc)
 
       # 9. 搜集并整理固件产物
       - name: Organize Artifacts
