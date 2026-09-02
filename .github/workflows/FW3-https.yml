@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 21.02.7 (FW3)
+name: Build ImmortalWrt 21.02.7 (FW3 https)
 
 on:
   workflow_dispatch:
