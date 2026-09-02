@@ -1,16 +1,11 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Native Nikki + FW4)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Native Nikki/Mihomo + FW4)
 
 on:
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: 'Release Tag Name'
-        required: false
-        default: 'v25.12.1-armsr'
 
 jobs:
   build:
-    name: Build ImmortalWrt RootFS & Images
+    name: Build ImmortalWrt RootFS
     runs-on: ubuntu-latest
 
     steps:
@@ -18,8 +13,8 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链及 HTTPS/CA 依赖
-      - name: Prepare Build Tools & Certificates
+      # 2. 准备编译工具链 (支持 zstd 与 xz)
+      - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
@@ -27,7 +22,7 @@ jobs:
           sudo update-ca-certificates
 
       # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
-      - name: Download & Extract ImageBuilder
+      - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
@@ -42,7 +37,7 @@ jobs:
           DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
           echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
 
-          curl -sSL "$DOWNLOAD_URL" -o ib_package.archive
+          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
 
           if [[ "$IB_FILE" == *.zst ]]; then
@@ -52,30 +47,29 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 下载并预置 HTTPS/SSL 根证书至镜像系统中
-      - name: Embed System CA Certificates
-        run: |
-          mkdir -p builder/files/etc/ssl/certs
-          cp /etc/ssl/certs/ca-certificates.crt builder/files/etc/ssl/certs/ca-certificates.crt
-
-      # 5. 精准获取并集成 Nikki (Mihomo UI) 最新 Release 离线 APK 包
-      - name: Download & Integrate Nikki (APK Format for 25.x)
+      # 4. 精准获取并集成 Nikki (Mihomo UI) 官方最新 Release 离线包
+      - name: Download & Integrate Nikki (Mihomo) Offline Packages
         run: |
           mkdir -p builder/packages
           cd builder/packages
 
-          echo "==> 从 GitHub API 获取 Nikki 最新 Releases..."
-          RELEASE_JSON=$(curl -sSL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
+          echo "==> 正在从 GitHub API 获取 Nikki 最新 Releases..."
+          RELEASE_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
 
-          # 提取适用于 armsr (aarch64/armv8) 的 apk 或 tar.gz 文件
-          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.tar\.gz)')
+          # 匹配适合 aarch64 / armv8 架构的离线安装包
+          DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)')
+
+          if [ -z "$DOWNLOAD_URLS" ]; then
+            echo "::warning:: 未在 Latest Release 中直接找到压缩包，尝试提取 Release Source/Assets..."
+            DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url')
+          fi
 
           for URL in $DOWNLOAD_URLS; do
             echo "正在下载 Nikki 组件: $URL"
             curl -sSL -O "$URL"
           done
 
-          # 处理下载到的 tar.gz 压缩包，解压提取 .apk 文件
+          # 如果下载到的是 .tar.gz 压缩包，则就地解压释放出内部的 apk/ipk 放置在 packages 目录
           for TARBALL in *.tar.gz; do
             if [ -f "$TARBALL" ]; then
               tar -zxvf "$TARBALL"
@@ -83,19 +77,18 @@ jobs:
             fi
           done
 
-          echo "当前集成至 ImageBuilder 本地 packages 目录的文件："
+          echo "当前集成至 ImageBuilder 本地库的软件包列表："
           ls -la
 
-      # 6. 集成 AdGuard Home 二进制 (ARM64)
+      # 5. 集成 AdGuard Home 二进制 (ARM64)
       - name: Integrate AdGuard Home Binary
         run: |
-          mkdir -p builder/files/opt/AdGuardHome
+          mkdir -p builder/files/opt
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
-          curl -sSL "$AGH_URL" | tar -zx -C /tmp/
-          mv /tmp/AdGuardHome/AdGuardHome builder/files/opt/AdGuardHome/
+          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 7. 配置 AdGuard Home 服务自启动 (Procd)
+      # 6. 配置 AdGuard Home 服务自启动
       - name: Configure AdGuard Home Service
         run: |
           mkdir -p builder/files/etc/init.d
@@ -123,12 +116,19 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 8. 打包 RootFS 与 镜像文件 (FW4 + APK 适配包)
-      - name: Build RootFS and Firmware Images
+      # [新增修改 1] 预置系统 HTTPS/SSL CA 根证书至固件内部
+      - name: Embed CA Certificates for HTTPS
+        run: |
+          mkdir -p builder/files/etc/ssl/certs
+          cp -f /etc/ssl/certs/ca-certificates.crt builder/files/etc/ssl/certs/ca-certificates.crt
+
+      # 7. 打包 RootFS
+      - name: Build RootFS
         run: |
           cd builder
 
-          # OpenWrt/ImmortalWrt 25.x 推荐的包依赖表 (使用 FW4 / nftables 架构)
+          # 依赖分析：包含 FW4 内核级 TPROXY 依赖与工具链
+          # 配合 Step 4 离线拉取放入 packages 目录的本地 nikki 文件
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -140,46 +140,30 @@ jobs:
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
-            curl wget-ssl ca-bundle ca-certificates \
+            curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          # ARMSR 架构的 Profile 通常为 generic
-          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 9. 整理并压缩产物
-      - name: Prepare Artifacts for Release
-        run: |
-          mkdir -p release_files
-          # 复制 RootFS tar.gz 压缩包
-          cp builder/bin/targets/armsr/armv8/*rootfs.tar.gz release_files/ 2>/dev/null || true
-          # 复制完整的构建镜像文件（如 .img.gz 或 .iso）
-          cp builder/bin/targets/armsr/armv8/*generic* release_files/ 2>/dev/null || true
-          
-          echo "==> 准备上传的文件列表："
-          ls -lh release_files/
-
-      # 10. 上传 Artifact 至 Actions 存储 (7天保留)
+      # 8. 上传 RootFS 编译产物 到 Actions Artifact
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-armsr
-          path: release_files/*
+          name: immortalwrt-25.12.1-armsr-rootfs
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 11. 发布编译产物到 GitHub Release
-      - name: Create GitHub Release
+      # [新增修改 2] 上传生成的 rootfs.tar.gz 固件到 GitHub Release
+      - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: success()
         with:
-          tag_name: ${{ github.event.inputs.release_tag || 'v25.12.1-armsr' }}
-          name: "ImmortalWrt 25.12.1 ARMSR Auto Build"
+          tag_name: "v25.12.1-armsr-${{ github.run_id }}"
+          name: "ImmortalWrt 25.12.1 RootFS (ARMSR)"
           body: |
-            ## ImmortalWrt 25.12.1 (ARMSR / ARMv8) 自动构建产物
-            - **内核/架构**: ARMSR / armv8 (64-bit)
-            - **包管理器**: APK (OpenWrt 25.x 原生)
-            - **防火墙**: FW4 (nftables / tproxy)
-            - **核心预装**: Native Nikki (Mihomo UI)、AdGuard Home Binary、Argon Theme、HTTPS/CA Certificates。
-          files: release_files/*
+            ImmortalWrt 25.12.1 RootFS 自动编译产物
+            构建时间: ${{ github.event.head_commit.timestamp || github.sha }}
+          files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
