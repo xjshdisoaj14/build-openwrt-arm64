@@ -22,8 +22,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
 
-      # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
-      - name: Download & Extract ImageBuilder (25.12.1 Direct)
+      # 3. 下载并解压 ImageBuilder (25.12.1 / armsr/armv8)
+      - name: Download & Extract ImageBuilder
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
@@ -48,11 +48,14 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 集成 Nikki 离线包并导入信任公钥
+      # 4. 下载 Nikki 离线包并配置 APK 信任公钥
       - name: Download & Integrate Nikki Packages
         run: |
+          # 创建本地离线包存放路径与系统密钥路径
           mkdir -p builder/packages
-          mkdir -p builder/etc/apk/keys/
+          mkdir -p builder/files/etc/apk/keys/
+          mkdir -p builder/keys
+
           cd builder/packages
 
           echo "==> 获取 Nikki 最新 Release..."
@@ -62,15 +65,12 @@ jobs:
           for URL in $DOWNLOAD_URLS; do
             echo "下载资源: $URL"
             if [[ "$URL" == *.pub ]]; then
-              curl --connect-timeout 10 --retry 3 -sSL "$URL" -o "../etc/apk/keys/$(basename $URL)"
+              curl --connect-timeout 10 --retry 3 -sSL "$URL" -o "../files/etc/apk/keys/$(basename $URL)"
+              cp -f "../files/etc/apk/keys/$(basename $URL)" "../keys/" 2>/dev/null || true
             else
               curl --connect-timeout 10 --retry 3 -sSL -O "$URL"
             fi
           done
-
-          # 如果 Release Asset 中没包含 .pub 秘钥，直接从公网源补充下载 Nikki 签名公钥
-          curl --connect-timeout 10 --retry 3 -sSL "https://github.com/nikkinikki-org/OpenWrt-nikki/raw/main/nikki.pub" \
-            -o "../etc/apk/keys/nikki.pub" 2>/dev/null || true
 
           # 解压所有的压缩包
           for TARBALL in *.tar.gz *.zip; do
@@ -86,8 +86,6 @@ jobs:
 
           echo "==> 过滤后的本地组件："
           ls -la *.apk || true
-          echo "==> 当前信任的公钥库："
-          ls -la ../etc/apk/keys/ || true
 
       # 5. 集成 daed 二进制
       - name: Integrate daed Binary
@@ -100,9 +98,8 @@ jobs:
           DAED_URL=$(echo "$DAED_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -iE '(arm64|aarch64)' | grep -iE '\.(tar\.gz|zip|gz)$' | head -n 1 || true)
 
           if [ -z "$DAED_URL" ]; then
-            echo "::warning:: 未在 API 中动态匹配到资源，使用备用 Tag 匹配下载路径..."
-            TAG_NAME=$(echo "$DAED_JSON" | jq -r '.tag_name // "v0.8.0"')
-            DAED_URL="https://github.com/daeuniverse/daed/releases/download/${TAG_NAME}/daed-linux-arm64.zip"
+            echo "::warning:: 未在 API 中动态匹配到资源，使用备用路径..."
+            DAED_URL="https://github.com/daeuniverse/daed/releases/download/v0.8.0/daed-linux-arm64.zip"
           fi
 
           echo "正在下载 daed: $DAED_URL"
@@ -136,13 +133,12 @@ jobs:
           curl --connect-timeout 15 --retry 3 -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 7. 配置后台服务自启动与 SSL/TLS 证书目录
-      - name: Configure System Services Init Scripts & SSL
+      # 7. 配置后台服务 Init 脚本
+      - name: Configure System Services Init Scripts
         run: |
           mkdir -p builder/files/etc/init.d
-          mkdir -p builder/files/etc/ssl/mycerts
 
-          # 1. 写入 AdGuardHome 服务脚本
+          # 1. AdGuardHome 服务脚本
           printf '%s\n' \
             '#!/bin/sh /etc/rc.common' \
             '' \
@@ -166,7 +162,7 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
-          # 2. 写入 daed 服务脚本
+          # 2. daed 服务脚本
           printf '%s\n' \
             '#!/bin/sh /etc/rc.common' \
             '' \
@@ -187,23 +183,18 @@ jobs:
 
           chmod +x builder/files/etc/init.d/daed
 
-# 8. 打包 RootFS (允许未授权本地包环境)
+      # 8. 打包 RootFS
       - name: Build RootFS
         run: |
           cd builder
 
-          # 1. 拷贝本地第三方 apk 密钥（如果有）
-          mkdir -p repositories/keys/
-          if [ -d "etc/apk/keys" ]; then
-            cp -f etc/apk/keys/* repositories/keys/ 2>/dev/null || true
-          fi
-
-          # 2. 收集本地包路径
+          # 提取下载好的本地第三方 apk 包名称（不含目录前缀）
           LOCAL_PACKAGES=""
           if [ -d "packages" ]; then
             for PKG in packages/*.apk; do
               if [ -f "$PKG" ]; then
-                LOCAL_PACKAGES="$LOCAL_PACKAGES $PKG"
+                # 获取包完整名称并追加到列表中
+                LOCAL_PACKAGES="$LOCAL_PACKAGES $(basename $PKG .apk)"
               fi
             done
           fi
@@ -227,7 +218,10 @@ jobs:
 
           ALL_PACKAGES="$BASE_PACKAGES $LOCAL_PACKAGES"
 
-          # 3. 关键修复：通过 APK_OPTS 向底层传递全局忽略签名验证参数
+          # 通过环境变量绕过 APK 签名拦截
+          export APK_FLAGS="--allow-untrusted"
+          export APK_OPTS="--allow-untrusted"
+
           make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" APK_OPTS="--allow-untrusted" -j$(nproc)
 
       # 9. 上传 RootFS 编译产物
