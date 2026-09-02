@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Full Proxy Suite + FW4)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Full Proxy Suite + HTTPS/TLS)
 
 on:
   workflow_dispatch:
@@ -13,12 +13,14 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链
+      # 2. 准备编译工具链 (优化网络与超时控制)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-          sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -o Acquire::http::Timeout="10" -o Acquire::ftp::Timeout="10"
+          sudo apt-get install -y --no-install-recommends \
+            make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
 
       # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
       - name: Download & Extract ImageBuilder (25.12.1 Direct)
@@ -26,7 +28,7 @@ jobs:
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
 
-          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+          IB_FILE=$(curl --connect-timeout 10 --retry 3 -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
             echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
@@ -36,7 +38,7 @@ jobs:
           DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
           echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
 
-          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
+          curl --connect-timeout 15 --retry 3 -sL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
 
           if [[ "$IB_FILE" == *.zst ]]; then
@@ -53,12 +55,12 @@ jobs:
           cd builder/packages
 
           echo "==> 正在获取 Nikki 最新 Releases..."
-          RELEASE_JSON=$(curl -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
+          RELEASE_JSON=$(curl --connect-timeout 10 --retry 3 -sL https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest)
           DOWNLOAD_URLS=$(echo "$RELEASE_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk)' || true)
 
           for URL in $DOWNLOAD_URLS; do
             echo "下载 Nikki 组件: $URL"
-            curl -sSL -O "$URL"
+            curl --connect-timeout 10 --retry 3 -sSL -O "$URL"
           done
 
           # 解压所有的压缩包
@@ -69,7 +71,7 @@ jobs:
             fi
           done
 
-          # 清理非 .apk 文件以及系统重名冲突包 (base-files, kernel, libc 等)
+          # 清理非 .apk 文件以及系统重名冲突包
           rm -f *.ipk
           rm -f base-files*.apk kernel*.apk libc*.apk mihomo*.apk
 
@@ -83,7 +85,7 @@ jobs:
           mkdir -p builder/files/etc/daed
 
           echo "==> 获取 daed 最新 Release 并提取 ARM64 二进制..."
-          DAED_JSON=$(curl -sL https://api.github.com/repos/daeuniverse/daed/releases/latest)
+          DAED_JSON=$(curl --connect-timeout 10 --retry 3 -sL https://api.github.com/repos/daeuniverse/daed/releases/latest)
           DAED_URL=$(echo "$DAED_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -iE '(arm64|aarch64)' | grep -iE '\.(tar\.gz|zip|gz)$' | head -n 1 || true)
 
           if [ -z "$DAED_URL" ]; then
@@ -93,7 +95,7 @@ jobs:
           fi
 
           echo "正在下载 daed: $DAED_URL"
-          curl -sSL "$DAED_URL" -o daed_download_file
+          curl --connect-timeout 15 --retry 3 -sSL "$DAED_URL" -o daed_download_file
 
           mkdir -p daed_tmp
           if unzip -t daed_download_file >/dev/null 2>&1; then
@@ -120,14 +122,16 @@ jobs:
         run: |
           mkdir -p builder/files/opt
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
-          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
+          curl --connect-timeout 15 --retry 3 -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-      # 7. 配置后台服务自启动
-      - name: Configure System Services Init Scripts
+      # 7. 配置后台服务自启动与 SSL/TLS 证书目录
+      - name: Configure System Services Init Scripts & SSL
         run: |
           mkdir -p builder/files/etc/init.d
+          mkdir -p builder/files/etc/ssl/mycerts
 
+          # 1. 写入 AdGuardHome 服务脚本
           printf '%s\n' \
             '#!/bin/sh /etc/rc.common' \
             '' \
@@ -151,6 +155,7 @@ jobs:
 
           chmod +x builder/files/etc/init.d/adguardhome
 
+          # 2. 写入 daed 服务脚本
           printf '%s\n' \
             '#!/bin/sh /etc/rc.common' \
             '' \
@@ -171,7 +176,7 @@ jobs:
 
           chmod +x builder/files/etc/init.d/daed
 
-      # 8. 打包 RootFS
+      # 8. 打包 RootFS (增加 HTTPS/SSL 软件包)
       - name: Build RootFS
         run: |
           cd builder
@@ -186,8 +191,13 @@ jobs:
             done
           fi
 
+          # 包含了 HTTPS/SSL 支持的完整包列表
           BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
+            luci-ssl \
+            openssl-util \
+            ca-bundle \
+            ca-certificates \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
@@ -195,7 +205,7 @@ jobs:
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
-            curl wget-ssl ca-certificates \
+            curl wget-ssl \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq \
             bpftool kmod-ikconfig"
 
