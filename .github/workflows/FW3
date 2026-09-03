@@ -3,6 +3,15 @@ name: Build ImmortalWrt 21.02.7 (FW3)
 on:
   workflow_dispatch:
 
+  push:
+    tags:
+      - 'v*'
+
+
+# 赋予 GitHub Actions 发布 Release 所需的写入权限
+permissions:
+  contents: write
+
 env:
   IMMORTALWRT_VER: "21.02.7"
   ADGUARD_VER: "v0.107.77"
@@ -98,11 +107,26 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 归档包供 Docker 使用
+      # 8. 上传 RootFS 归档包供 GitHub Artifacts 临时下载
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-21.02.7-armvirt-64-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
+
+      # 9. 自动发布到 GitHub Release 页面 (使用 softprops/action-gh-release@v2)
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "ImmortalWrt 21.02.7 RootFS (${{ github.ref_name }})"
+          body: |
+            ### 自动化构建完成
+            - **固件版本**: ImmortalWrt ${{ env.IMMORTALWRT_VER }}
+            - **内核/架构**: armvirt/64
+            - **集成组件**: uHTTPd (HTTP/HTTPS), AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS 等。
+          files: builder/bin/targets/armvirt/64/*rootfs.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
