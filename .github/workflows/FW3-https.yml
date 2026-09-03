@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 21.02.7 (FW3)
+name: Build ImmortalWrt 21.02.7 (FW3 https)
 
 on:
   workflow_dispatch:
@@ -131,7 +131,7 @@ jobs:
           name: immortalwrt-21.02.7-armvirt-64-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
       # 9. 自动发布到 GitHub Release 页面
       - name: Publish to GitHub Release
