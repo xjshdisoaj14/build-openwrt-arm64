@@ -6,7 +6,6 @@ on:
     tags:
       - 'v*'
 
-# 赋予 GitHub Actions 发布 Release 所需的写入权限
 permissions:
   contents: write
 
@@ -38,7 +37,7 @@ jobs:
           wget -qO- "$IB_URL" | tar -xJ
           mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
 
-      # 4. 集成 AdGuard Home ARM64 官方二进制文件（放置在默认路径 /usr/bin/AdGuardHome/）
+      # 4. 集成 AdGuard Home ARM64 官方二进制文件
       - name: Integrate AdGuard Home ARM64 Binary
         run: |
           mkdir -p builder/files/usr/bin/AdGuardHome
@@ -48,10 +47,9 @@ jobs:
           chmod +x builder/files/usr/bin/AdGuardHome/AdGuardHome
           rm -rf /tmp/AdGuardHome
 
-      # 5. 集成 luci-app-adguardhome 与 luci-app-uhttpd 源码至 files 目录（在系统菜单下添加 Web/uHTTPd 设置）
-      - name: Integrate LuCI Apps Files
+      # 5. 集成 luci-app-adguardhome 源码至 files 目录
+      - name: Integrate luci-app-adguardhome Files
         run: |
-          # 1. 集成 AdGuardHome LuCI 界面
           git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
           
           mkdir -p builder/files/etc/init.d
@@ -69,17 +67,9 @@ jobs:
             cp -r /tmp/luci-app-adguardhome/htdocs/* builder/files/www/
           fi
 
-          # 2. 从官方包库提取 luci-app-uhttpd 界面放入 系统(System) 菜单下
-          git clone --depth=1 https://github.com/openwrt/luci.git /tmp/openwrt-luci
-          if [ -d /tmp/openwrt-luci/applications/luci-app-uhttpd/luasrc ]; then
-            cp -r /tmp/openwrt-luci/applications/luci-app-uhttpd/luasrc/* builder/files/usr/lib/lua/luci/
-          fi
-          rm -rf /tmp/openwrt-luci /tmp/luci-app-adguardhome
-
-          # 确保 init.d 后台服务脚本拥有可执行权限
           chmod +x builder/files/etc/init.d/* 2>/dev/null || true
 
-      # 6. 预设 UCI 默认配置（保证默认二进制路径与重定向正确）
+      # 6. 预设 UCI 默认配置 (AdGuardHome)
       - name: Create Default AdGuard Home UCI Config
         run: |
           mkdir -p builder/files/etc/config
@@ -91,7 +81,21 @@ jobs:
               option redirect_mode 'exchange'
           EOF
 
-      # 7. 执行打包（加入 uHTTPd 及 px5g 证书自动生成支持）
+      # 6.5 配置 uHTTPd 开机默认启用 HTTPS 重定向（核心逻辑）
+      - name: Configure uHTTPd Auto Redirect to HTTPS
+        run: |
+          mkdir -p builder/files/etc/uci-defaults
+          cat << 'EOF' > builder/files/etc/uci-defaults/99-uhttpd-https
+          #!/bin/sh
+          # 开启 80 端口到 443 端口的自动重定向
+          uci set uhttpd.main.redirect_https='1'
+          # 如果没有生成证书，px5g 会自动在启动时生成 SSL 证书
+          uci commit uhttpd
+          exit 0
+          EOF
+          chmod +x builder/files/etc/uci-defaults/99-uhttpd-https
+
+      # 7. 执行打包（保持极简，只安装底层证书生成工具，不安装 luci-app-uhttpd）
       - name: Build RootFS
         run: |
           cd builder
@@ -99,7 +103,7 @@ jobs:
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
-            uhttpd px5g-standalone \
+            px5g-standalone \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             luci-i18n-passwall-zh-cn xray-core ipset \
@@ -110,16 +114,16 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 归档包供 GitHub Artifacts 临时下载
+      # 8. 上传 RootFS 归档包
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-21.02.7-armvirt-64-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
 
-      # 9. 自动发布到 GitHub Release 页面 (使用 softprops/action-gh-release@v2)
+      # 9. 发布到 GitHub Release
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -129,7 +133,7 @@ jobs:
             ### 自动化构建完成
             - **固件版本**: ImmortalWrt ${{ env.IMMORTALWRT_VER }}
             - **内核/架构**: armvirt/64
-            - **集成组件**: uHTTPd (HTTP/HTTPS), AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS 等。
+            - **HTTP 特性**: 已开机默认启用 HTTP -> HTTPS 自动强制重定向。
           files: builder/bin/targets/armvirt/64/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
