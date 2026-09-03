@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 21.02.7 (FW3 https)
+name: Build ImmortalWrt 21.02.7 (FW3)
 
 on:
   workflow_dispatch:
@@ -75,10 +75,12 @@ jobs:
           # 确保 init.d 后台服务脚本拥有可执行权限
           chmod +x builder/files/etc/init.d/* 2>/dev/null || true
 
-      # 6. 预设 UCI 默认配置（保证默认二进制路径与重定向正确）
-      - name: Create Default AdGuard Home UCI Config
+      # 6. 预设 UCI 默认配置（保证默认二进制路径与重定向正确，并配置 uHTTPd 启用 HTTPS）
+      - name: Create Default UCI Config
         run: |
           mkdir -p builder/files/etc/config
+          
+          # AdGuard Home 配置
           cat << 'EOF' > builder/files/etc/config/adguardhome
           config adguardhome 'config'
               option enabled '1'
@@ -87,7 +89,23 @@ jobs:
               option redirect_mode 'exchange'
           EOF
 
-      # 7. 执行打包（加入 uHTTPd 及 Web 管理支持，支持 HTTP 与 HTTPS）
+          # uHTTPd 配置：开启 HTTP 自动跳转 HTTPS
+          cat << 'EOF' > builder/files/etc/config/uhttpd
+          config uhttpd 'main'
+              list listen_http '0.0.0.0:80'
+              list listen_http '[::]:80'
+              list listen_https '0.0.0.0:443'
+              list listen_https '[::]:443'
+              option home '/www'
+              option rfc1918_filter '1'
+              option max_requests '3'
+              option max_connections '100'
+              option cert '/etc/uhttpd.crt'
+              option key '/etc/uhttpd.key'
+              option redirect_https '1'
+          EOF
+
+      # 7. 执行打包（集成轻量 uhttpd + px5g-standalone 证书工具）
       - name: Build RootFS
         run: |
           cd builder
@@ -95,7 +113,7 @@ jobs:
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
-            uhttpd luci-app-uhttpd px5g-standalone \
+            uhttpd px5g-standalone \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             luci-i18n-passwall-zh-cn xray-core ipset \
@@ -106,7 +124,7 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 归档包供 GitHub Artifacts 临时下载
+      # 8. 上传 RootFS 归档包供 Docker 使用
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -115,7 +133,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 9. 自动发布到 GitHub Release 页面 (使用 softprops/action-gh-release@v2)
+      # 9. 自动发布到 GitHub Release 页面
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -125,7 +143,7 @@ jobs:
             ### 自动化构建完成
             - **固件版本**: ImmortalWrt ${{ env.IMMORTALWRT_VER }}
             - **内核/架构**: armvirt/64
-            - **集成组件**: uHTTPd (HTTP/HTTPS), AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS 等。
+            - **Web访问**: 已开启 uHTTPd HTTPS 支持
           files: builder/bin/targets/armvirt/64/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
