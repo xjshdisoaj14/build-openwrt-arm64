@@ -6,6 +6,7 @@ on:
     tags:
       - 'v*'
 
+# 赋予 GitHub Actions 发布 Release 所需的写入权限
 permissions:
   contents: write
 
@@ -37,7 +38,7 @@ jobs:
           wget -qO- "$IB_URL" | tar -xJ
           mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
 
-      # 4. 集成 AdGuard Home ARM64 官方二进制文件
+      # 4. 集成 AdGuard Home ARM64 官方二进制文件（放置在默认路径 /usr/bin/AdGuardHome/）
       - name: Integrate AdGuard Home ARM64 Binary
         run: |
           mkdir -p builder/files/usr/bin/AdGuardHome
@@ -47,19 +48,23 @@ jobs:
           chmod +x builder/files/usr/bin/AdGuardHome/AdGuardHome
           rm -rf /tmp/AdGuardHome
 
-      # 5. 集成 luci-app-adguardhome 源码至 files 目录
+      # 5. 集成 luci-app-adguardhome 源码至 files 目录（含 init.d 服务与 LuCI 视图）
       - name: Integrate luci-app-adguardhome Files
         run: |
           git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
           
+          # 创建对应的文件系统路径
           mkdir -p builder/files/etc/init.d
           mkdir -p builder/files/etc/config
           mkdir -p builder/files/usr/lib/lua/luci
           mkdir -p builder/files/www
           
+          # 提取 root 目录（包含 /etc/init.d/AdGuardHome 及 UCI 默认规则）
           if [ -d /tmp/luci-app-adguardhome/root ]; then
             cp -r /tmp/luci-app-adguardhome/root/* builder/files/
           fi
+          
+          # 提取 Lua 控制界面与 Web 页面
           if [ -d /tmp/luci-app-adguardhome/luasrc ]; then
             cp -r /tmp/luci-app-adguardhome/luasrc/* builder/files/usr/lib/lua/luci/
           fi
@@ -67,9 +72,10 @@ jobs:
             cp -r /tmp/luci-app-adguardhome/htdocs/* builder/files/www/
           fi
 
+          # 确保 init.d 后台服务脚本拥有可执行权限
           chmod +x builder/files/etc/init.d/* 2>/dev/null || true
 
-      # 6. 预设 UCI 默认配置 (AdGuardHome)
+      # 6. 预设 UCI 默认配置（保证默认二进制路径与重定向正确）
       - name: Create Default AdGuard Home UCI Config
         run: |
           mkdir -p builder/files/etc/config
@@ -81,35 +87,7 @@ jobs:
               option redirect_mode 'exchange'
           EOF
 
-      # 6.5 修改系统“管理权”页面代码，强行注入“HTTP(S) 访问”标签页
-      - name: Inject HTTP(S) Tab into System Administration Page
-        run: |
-          mkdir -p builder/files/etc/uci-defaults
-          cat << 'EOF' > builder/files/etc/uci-defaults/99-inject-https-tab
-          #!/bin/sh
-          # 检查 Lua 版管理权页面 CBI 文件是否存在
-          CBI_FILE="/usr/lib/lua/luci/model/cbi/admin_system/password.lua"
-
-          if [ -f "$CBI_FILE" ]; then
-            # 向管理权页面增加 HTTP(S) 访问 标签页及重定向开关选项
-            cat << 'SUBEOF' >> "$CBI_FILE"
-
-          -- Inject HTTP(S) Settings Tab
-          s = m:section(NamedSection, "main", "uhttpd", translate("HTTP(S) 访问"))
-          s.anonymous = true
-
-          s:tab("https", translate("HTTP(S) 设置"))
-
-          o = s:taboption("https", Flag, "redirect_https", translate("重定向到 HTTPS"), translate("自动将所有 HTTP 80 端口请求重定向至 HTTPS 443 端口"))
-          o.rmempty = false
-          SUBEOF
-          fi
-
-          exit 0
-          EOF
-          chmod +x builder/files/etc/uci-defaults/99-inject-https-tab
-
-      # 7. 执行打包（只需 px5g-standalone 生成 SSL 证书，无需 luci-app-uhttpd）
+      # 7. 执行打包（加入 uHTTPd 及 Web 管理支持，支持 HTTP 与 HTTPS）
       - name: Build RootFS
         run: |
           cd builder
@@ -117,7 +95,7 @@ jobs:
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
-            px5g-standalone \
+            uhttpd luci-app-uhttpd px5g-standalone \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             luci-i18n-passwall-zh-cn xray-core ipset \
@@ -128,16 +106,16 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 归档包
+      # 8. 上传 RootFS 归档包供 GitHub Artifacts 临时下载
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-21.02.7-armvirt-64-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
 
-      # 9. 发布到 GitHub Release
+      # 9. 自动发布到 GitHub Release 页面 (使用 softprops/action-gh-release@v2)
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -147,7 +125,7 @@ jobs:
             ### 自动化构建完成
             - **固件版本**: ImmortalWrt ${{ env.IMMORTALWRT_VER }}
             - **内核/架构**: armvirt/64
-            - **管理权页面**: 已在“系统 -> 管理权”下注入“HTTP(S) 访问”标签页及“重定向到 HTTPS”勾选项。
+            - **集成组件**: uHTTPd (HTTP/HTTPS), AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS 等。
           files: builder/bin/targets/armvirt/64/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
