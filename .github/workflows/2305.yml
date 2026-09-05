@@ -6,6 +6,7 @@ on:
     tags:
       - 'v*'
 
+# 赋予 GitHub Actions 发布 Release 所需的写入权限
 permissions:
   contents: write
 
@@ -37,29 +38,34 @@ jobs:
           wget -qO- "$IB_URL" | tar -xJ
           mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
 
-      # 4. 集成 AdGuard Home ARM64 官方二进制文件
+      # 4. 集成 AdGuard Home ARM64 官方二进制文件（放置在默认路径 /usr/bin/AdGuardHome/）
       - name: Integrate AdGuard Home ARM64 Binary
         run: |
           mkdir -p builder/files/usr/bin/AdGuardHome
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/${ADGUARD_VER}/AdGuardHome_linux_arm64.tar.gz"
-          curl -sSL "$AGH_URL" | tar -zx -C /tmp
+          curl -sSL "$AGH_URL" | tar -zx -C /tmp/
           mv /tmp/AdGuardHome/AdGuardHome builder/files/usr/bin/AdGuardHome/AdGuardHome
           chmod +x builder/files/usr/bin/AdGuardHome/AdGuardHome
           rm -rf /tmp/AdGuardHome
 
-      # 5. 集成 luci-app-adguardhome 文件资源至 files 目录
+      # 5. 集成 luci-app-adguardhome 源码至 files 目录（含 init.d 服务、UCI 规则与 uci-defaults）
       - name: Integrate luci-app-adguardhome Files
         run: |
           git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
           
+          # 创建对应的文件系统路径
           mkdir -p builder/files/etc/init.d
           mkdir -p builder/files/etc/config
+          mkdir -p builder/files/etc/uci-defaults
           mkdir -p builder/files/usr/lib/lua/luci
           mkdir -p builder/files/www
           
+          # 提取 root 目录（包含 /etc/init.d/AdGuardHome、UCI 默认规则及 uci-defaults 注册脚本）
           if [ -d /tmp/luci-app-adguardhome/root ]; then
             cp -r /tmp/luci-app-adguardhome/root/* builder/files/
           fi
+          
+          # 提取 Lua 控制界面与 Web 页面
           if [ -d /tmp/luci-app-adguardhome/luasrc ]; then
             cp -r /tmp/luci-app-adguardhome/luasrc/* builder/files/usr/lib/lua/luci/
           fi
@@ -67,21 +73,24 @@ jobs:
             cp -r /tmp/luci-app-adguardhome/htdocs/* builder/files/www/
           fi
 
+          # 确保 init.d 和 uci-defaults 脚本拥有可执行权限
           chmod +x builder/files/etc/init.d/* 2>/dev/null || true
+          chmod +x builder/files/etc/uci-defaults/* 2>/dev/null || true
+          rm -rf /tmp/luci-app-adguardhome
 
-      # 6. 预设 AdGuard Home UCI 默认配置
+      # 6. 预设 UCI 默认配置（保证默认二进制路径与重定向正确）
       - name: Create Default AdGuard Home UCI Config
         run: |
           mkdir -p builder/files/etc/config
           cat << 'EOF' > builder/files/etc/config/adguardhome
-config adguardhome 'config'
-    option enabled '1'
-    option binpath '/usr/bin/AdGuardHome/AdGuardHome'
-    option workpath '/usr/bin/AdGuardHome'
-    option redirect_mode 'exchange'
-EOF
+          config adguardhome 'config'
+              option enabled '1'
+              option binpath '/usr/bin/AdGuardHome/AdGuardHome'
+              option workpath '/usr/bin/AdGuardHome'
+              option redirect_mode 'exchange'
+          EOF
 
-      # 7. 执行打包（FW4 / nftables 软件栈）
+      # 7. 执行打包（FW4 / nftables 软件栈，自动关联核心依赖项）
       - name: Build RootFS
         run: |
           cd builder
@@ -95,11 +104,12 @@ EOF
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
-            curl wget-ssl ca-certificates nftables kmod-nft-tproxy"
+            curl wget-ssl ca-certificates ca-bundle tar \
+            nftables kmod-nft-tproxy"
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 归档包
+      # 8. 上传 RootFS 归档包供 GitHub Artifacts 临时下载
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -108,18 +118,18 @@ EOF
           if-no-files-found: error
           retention-days: 30
 
-      # 9. 自动发布到 GitHub Release
+      # 9. 自动发布到 GitHub Release 页面 (使用 softprops/action-gh-release@v2)
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: "ImmortalWrt 23.05.4 RootFS (${{ github.ref_name }})"
           body: |
-            ### 自动化构建完成 (FW4 / 23.05)
+            ### 自动化构建完成 (FW4 / 23.05.4)
             - **固件版本**: ImmortalWrt ${{ env.IMMORTALWRT_VER }}
             - **内核/架构**: armvirt/64
             - **防火墙架构**: FW4 (nftables)
-            - **集成组件**: AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS, SoftEtherVPN 等。
+            - **集成组件**: AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS, SoftEtherVPN, VLMCSD 等。
           files: builder/bin/targets/armvirt/64/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
