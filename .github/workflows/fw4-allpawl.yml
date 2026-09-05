@@ -54,57 +54,54 @@ jobs:
           mkdir -p builder/packages
           cd builder/packages
 
-          # 通用拉取函数：匹配 aarch64/arm64/all 的 apk 或压缩包
-          download_latest_assets() {
-            local repo=$1
-            echo "==> 正在获取 $repo 的最新 Releases..."
-            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
-            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)')
-            for url in $urls; do
-              echo "正在下载: $url"
-              curl -sSL -O "$url"
-            done
-          }
-
-          # 1) Nikki (内置 Mihomo 核心)
-          download_latest_assets "nikkinikki-org/OpenWrt-nikki"
-
-          # 2) MosDNS (sbwml 维护版本)
-          download_latest_assets "mosdns/luci-app-mosdns" || download_latest_assets "sbwml/luci-app-mosdns"
-
-          # 3) Daed (dae UI)
-          download_latest_assets "daed-project/daed-openwrt" || true
-
-          # 4) PassWall2 (抓取包含 APK 产物的适配仓库或构建好的Release)
-          echo "==> 正在获取 PassWall2 最新 APK 组件..."
-          PW2_JSON=$(curl -sL "https://api.github.com/repos/xiaorouji/openwrt-passwall2/releases")
-          PW2_URLS=$(echo "$PW2_JSON" | jq -r '.[0].assets[].browser_download_url' | grep -E '\.(apk|zip|tar\.gz)$')
-          
-          if [ -z "$PW2_URLS" ]; then
-            # 备用方案：如果源项目无现成 apk，从社区预编译全量 APK 源抓取 passwall2
-            echo "源仓库未直接包含 APK，尝试从 PassWall 软件源抓取..."
-            PW2_URLS=$(curl -sL "https://api.github.com/repos/xiaorouji/openwrt-passwall/releases/latest" | jq -r '.assets[].browser_download_url' | grep -E '(passwall2|\.apk)')
+          # 1) 精准获取 Nikki (适配 25.12 且仅限 aarch64_generic)
+          echo "==> 正在获取 Nikki 的最新 Releases..."
+          NIKKI_URL=$(curl -sL "https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest" | jq -r '.assets[].browser_download_url' | grep -E 'aarch64_generic-openwrt-25\.12\.tar\.gz' | head -n 1)
+          if [ -n "$NIKKI_URL" ]; then
+            echo "正在下载 Nikki: $NIKKI_URL"
+            curl -sSL -O "$NIKKI_URL"
           fi
 
-          for url in $PW2_URLS; do
-            echo "正在下载 PassWall2 依赖: $url"
+          # 2) 获取 MosDNS (sbwml 维护版本)
+          echo "==> 正在获取 MosDNS 的最新 Releases..."
+          MOSDNS_URLS=$(curl -sL "https://api.github.com/repos/sbwml/luci-app-mosdns/releases/latest" | jq -r '.assets[].browser_download_url // empty' | grep -E '(\.apk|\.tar\.gz|\.zip)')
+          for url in $MOSDNS_URLS; do
+            echo "正在下载 MosDNS 组件: $url"
             curl -sSL -O "$url"
           done
 
-          # 处理解压：遇到 tar.gz / zip 压缩包，解压后提取 apk 放置于 packages 根目录
+          # 3) 获取 Daed (dae UI)
+          echo "==> 正在获取 Daed 的最新 Releases..."
+          DAED_URLS=$(curl -sL "https://api.github.com/repos/daed-project/daed-openwrt/releases/latest" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk)')
+          for url in $DAED_URLS; do
+            echo "正在下载 Daed 组件: $url"
+            curl -sSL -O "$url"
+          done
+
+          # 4) 获取 PassWall2
+          echo "==> 正在获取 PassWall2 最新 Releases..."
+          PW2_URLS=$(curl -sL "https://api.github.com/repos/xiaorouji/openwrt-passwall2/releases/latest" | jq -r '.assets[].browser_download_url // empty' | grep -E '(\.apk|\.zip|\.tar\.gz)')
+          for url in $PW2_URLS; do
+            echo "正在下载 PassWall2 组件: $url"
+            curl -sSL -O "$url"
+          done
+
+          # 批量处理解压所有压缩包
           for archive in *.tar.gz *.zip; do
             if [ -f "$archive" ]; then
+              echo "正在解压: $archive"
               tar -zxvf "$archive" 2>/dev/null || unzip -o "$archive" 2>/dev/null || true
               rm -f "$archive"
             fi
           done
 
-          # 确保解压到子目录里的 .apk 文件全部挪到 packages 根目录供 ImageBuilder 扫描
+          # 确保所有子目录下的 .apk 文件全部挪到 packages 根目录
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
-          # 如果依旧没提取到 luci-app-passwall2.apk，尝试将所有 ipk 解压转换或打入基础适配
+          echo "=========================================="
           echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
           ls -la *.apk || true
+          echo "=========================================="
 
       # 5. 集成 AdGuard Home 二进制 (ARM64)
       - name: Integrate AdGuard Home Binary
@@ -146,15 +143,12 @@ jobs:
         run: |
           cd builder
 
-          # 如果没有抓取到 passwall2 离线 apk 包，则在构建命令中容错处理
+          # 构建基础包列表
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            nikki luci-app-nikki luci-i18n-nikki-zh-cn \
-            mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-            daed luci-app-daed \
             luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
@@ -162,13 +156,25 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          # 检查离线包目录是否有 passwall2，有则加入打包列表
-          if ls packages/luci-app-passwall2*.apk 1> /dev/null 2>&1; then
-            echo "找到 PassWall2 APK，加入打包参数..."
-            PACKAGES="$PACKAGES luci-app-passwall2 luci-i18n-passwall2-zh-cn"
-          else
-            echo "::warning::未检测到 PassWall2 离线 APK 包，跳过 PassWall2 打包以保证构建成功。"
+          # 容错处理：根据实际解压出的 APK 文件名，动态挂载对应软件包
+          if ls packages/*nikki*.apk 1> /dev/null 2>&1; then
+            PACKAGES="$PACKAGES nikki luci-app-nikki luci-i18n-nikki-zh-cn"
           fi
+
+          if ls packages/*mosdns*.apk 1> /dev/null 2>&1; then
+            PACKAGES="$PACKAGES mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn"
+          fi
+
+          if ls packages/*daed*.apk 1> /dev/null 2>&1; then
+            PACKAGES="$PACKAGES daed luci-app-daed"
+          fi
+
+          if ls packages/*passwall2*.apk 1> /dev/null 2>&1; then
+            PACKAGES="$PACKAGES luci-app-passwall2 luci-i18n-passwall2-zh-cn"
+          fi
+
+          echo "最终参与打包的 PACKAGES 列表："
+          echo "$PACKAGES"
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
@@ -192,10 +198,8 @@ jobs:
             ## ImmortalWrt 25.12.1 (ARMSR / armv8) 自动构建
             - **架构 / 包管理器**: ARMSR (ARM64) / APK
             - **内置组件**: 
-              - PassWall2 (如离线包获取成功)
-              - Nikki (Mihomo 核心)
-              - MosDNS & AdGuard Home
-              - Daed 代理前端
+              - PassWall2 / Nikki / MosDNS / Daed (基于解压成功项集成)
+              - AdGuard Home 二进制
               - HTTPS / ACME 自动化证书工具链
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
