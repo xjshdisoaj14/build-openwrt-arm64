@@ -124,12 +124,12 @@ jobs:
         run: |
           mkdir -p builder/files/etc/config
           cat << 'EOF' > builder/files/etc/config/adguardhome
-config adguardhome 'config'
-    option enabled '1'
-    option binpath '/opt/AdGuardHome/AdGuardHome'
-    option workpath '/opt/AdGuardHome'
-    option redirect_mode 'exchange'
-EOF
+          config adguardhome 'config'
+              option enabled '1'
+              option binpath '/opt/AdGuardHome/AdGuardHome'
+              option workpath '/opt/AdGuardHome'
+              option redirect_mode 'exchange'
+          EOF
 
       # 7. 执行打包 (FW4 / 23.05 对应 nftables 软件栈)
       - name: Build RootFS
