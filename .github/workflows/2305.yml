@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 23.05.3 (FW4)
+name: Build ImmortalWrt 23.05.4 (FW4)
 
 on:
   workflow_dispatch:
@@ -6,17 +6,16 @@ on:
     tags:
       - 'v*'
 
-# 赋予 GitHub Actions 发布 Release 所需的写入权限
 permissions:
   contents: write
 
 env:
-  IMMORTALWRT_VER: "23.05.3"
+  IMMORTALWRT_VER: "23.05.4"
   ADGUARD_VER: "v0.107.77"
 
 jobs:
   build:
-    name: Build ImmortalWrt 23.05.3 RootFS
+    name: Build ImmortalWrt 23.05.4 RootFS
     runs-on: ubuntu-latest
 
     steps:
@@ -31,7 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools git gettext
 
-      # 3. 下载并解压 23.05.3 armvirt/64 ImageBuilder
+      # 3. 下载并解压 23.05.4 armvirt/64 ImageBuilder
       - name: Download & Extract ImageBuilder
         run: |
           IB_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.xz"
@@ -48,30 +47,45 @@ jobs:
           chmod +x builder/files/usr/bin/AdGuardHome/AdGuardHome
           rm -rf /tmp/AdGuardHome
 
-      # 5. 预设 AdGuard Home UCI 默认配置
+      # 5. 集成 luci-app-adguardhome 文件资源至 files 目录
+      - name: Integrate luci-app-adguardhome Files
+        run: |
+          git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
+          
+          mkdir -p builder/files/etc/init.d
+          mkdir -p builder/files/etc/config
+          mkdir -p builder/files/usr/lib/lua/luci
+          mkdir -p builder/files/www
+          
+          if [ -d /tmp/luci-app-adguardhome/root ]; then
+            cp -r /tmp/luci-app-adguardhome/root/* builder/files/
+          fi
+          if [ -d /tmp/luci-app-adguardhome/luasrc ]; then
+            cp -r /tmp/luci-app-adguardhome/luasrc/* builder/files/usr/lib/lua/luci/
+          fi
+          if [ -d /tmp/luci-app-adguardhome/htdocs ]; then
+            cp -r /tmp/luci-app-adguardhome/htdocs/* builder/files/www/
+          fi
+
+          chmod +x builder/files/etc/init.d/* 2>/dev/null || true
+
+      # 6. 预设 AdGuard Home UCI 默认配置
       - name: Create Default AdGuard Home UCI Config
         run: |
           mkdir -p builder/files/etc/config
           cat << 'EOF' > builder/files/etc/config/adguardhome
-          config adguardhome 'config'
-              option enabled '1'
-              option binpath '/usr/bin/AdGuardHome/AdGuardHome'
-              option workpath '/usr/bin/AdGuardHome'
-              option redirect_mode 'exchange'
-          EOF
+config adguardhome 'config'
+    option enabled '1'
+    option binpath '/usr/bin/AdGuardHome/AdGuardHome'
+    option workpath '/usr/bin/AdGuardHome'
+    option redirect_mode 'exchange'
+EOF
 
-      # 6. 拉取 luci-app-adguardhome 并放入 packages 目录由 ImageBuilder 统一打包
-      - name: Prepare luci-app-adguardhome Package
-        run: |
-          mkdir -p builder/packages
-          git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git builder/package/luci-app-adguardhome
-
-      # 7. 执行打包（适应 23.05 FW4/nftables 软件栈）
+      # 7. 执行打包（FW4 / nftables 软件栈）
       - name: Build RootFS
         run: |
           cd builder
           
-          # 23.05 架构更新：移除旧版 iptables 依赖，替换为 nftables 协议栈与 tproxy 支持
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -81,32 +95,31 @@ jobs:
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
-            luci-app-adguardhome \
             curl wget-ssl ca-certificates nftables kmod-nft-tproxy"
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 归档包供 GitHub Artifacts 临时下载
+      # 8. 上传 RootFS 归档包
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-23.05.3-armvirt-64-rootfs
+          name: immortalwrt-23.05.4-armvirt-64-rootfs
           path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 30
 
-      # 9. 自动发布到 GitHub Release 页面
+      # 9. 自动发布到 GitHub Release
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "ImmortalWrt 23.05.3 RootFS (${{ github.ref_name }})"
+          name: "ImmortalWrt 23.05.4 RootFS (${{ github.ref_name }})"
           body: |
             ### 自动化构建完成 (FW4 / 23.05)
             - **固件版本**: ImmortalWrt ${{ env.IMMORTALWRT_VER }}
             - **内核/架构**: armvirt/64
             - **防火墙架构**: FW4 (nftables)
-            - **集成组件**: AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS, SoftEtherVPN, VLMCSD 等。
+            - **集成组件**: AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS, SoftEtherVPN 等。
           files: builder/bin/targets/armvirt/64/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
