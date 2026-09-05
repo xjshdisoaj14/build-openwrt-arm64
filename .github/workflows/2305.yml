@@ -53,12 +53,12 @@ jobs:
         run: |
           mkdir -p builder/files/etc/config
           cat << 'EOF' > builder/files/etc/config/adguardhome
-config adguardhome 'config'
-    option enabled '1'
-    option binpath '/usr/bin/AdGuardHome/AdGuardHome'
-    option workpath '/usr/bin/AdGuardHome'
-    option redirect_mode 'exchange'
-EOF
+          config adguardhome 'config'
+              option enabled '1'
+              option binpath '/usr/bin/AdGuardHome/AdGuardHome'
+              option workpath '/usr/bin/AdGuardHome'
+              option redirect_mode 'exchange'
+          EOF
 
       # 6. 拉取 luci-app-adguardhome 并放入 packages 目录由 ImageBuilder 统一打包
       - name: Prepare luci-app-adguardhome Package
