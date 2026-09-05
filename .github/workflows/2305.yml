@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 23.05.4 (FW4)
+name: Build ImmortalWrt 23.05 (FW4)
 
 on:
   workflow_dispatch:
@@ -6,17 +6,16 @@ on:
     tags:
       - 'v*'
 
-# 赋予 GitHub Actions 发布 Release 所需的写入权限
 permissions:
   contents: write
 
 env:
-  IMMORTALWRT_VER: "23.05.4"
+  PREFERRED_VER: "23.05.4"
   ADGUARD_VER: "v0.107.77"
 
 jobs:
   build:
-    name: Build ImmortalWrt 23.05.4 RootFS
+    name: Build ImmortalWrt 23.05 RootFS
     runs-on: ubuntu-latest
 
     steps:
@@ -24,48 +23,91 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 清理磁盘空间并安装标准构建工具
-      - name: Free Disk Space & Install Dependencies
+      # 2. 准备编译工具链
+      - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar qemu-utils dosfstools mtools git gettext
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-      # 3. 下载并解压 23.05.4 armvirt/64 ImageBuilder
+      # 3. 动态匹配与获取 ImageBuilder (全路径防 404 回退与校验机制)
       - name: Download & Extract ImageBuilder
         run: |
-          IB_URL="https://downloads.immortalwrt.org/releases/${IMMORTALWRT_VER}/targets/armvirt/64/immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64.tar.xz"
-          wget -qO- "$IB_URL" | tar -xJ
-          mv immortalwrt-imagebuilder-${IMMORTALWRT_VER}-armvirt-64.Linux-x86_64 builder
+          # 依次尝试的版本列表 (23.05 系列)
+          VERSIONS=("23.05.4" "23.05.3" "23.05.2" "snapshots")
+          # 依次尝试的目标架构路径
+          TARGET_PATHS=("targets/armvirt/64" "targets/armsr/armv8")
 
-      # 4. 集成 AdGuard Home ARM64 官方二进制文件（放置在默认路径 /usr/bin/AdGuardHome/）
-      - name: Integrate AdGuard Home ARM64 Binary
+          DOWNLOAD_SUCCESS=false
+
+          for VER in "${VERSIONS[@]}"; do
+            for PATH_SUFFIX in "${TARGET_PATHS[@]}"; do
+              TARGET_DIR="https://downloads.immortalwrt.org/releases/${VER}/${PATH_SUFFIX}/"
+              if [ "$VER" = "snapshots" ]; then
+                TARGET_DIR="https://downloads.immortalwrt.org/snapshots/${PATH_SUFFIX}/"
+              fi
+
+              echo "尝试连接存储库: ${TARGET_DIR}"
+              HTML_CONTENT=$(curl -sL "$TARGET_DIR" || true)
+              
+              # 获取 ImageBuilder 压缩包文件名 (.tar.xz 或 .tar.zst)
+              IB_FILE=$(echo "$HTML_CONTENT" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1 || true)
+
+              if [ -n "$IB_FILE" ]; then
+                DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
+                echo "找到候选地址: ${DOWNLOAD_URL}"
+                
+                mkdir -p builder
+                curl -sSL "$DOWNLOAD_URL" -o ib_package.archive
+                
+                # 校验文件真实格式，防止下载到 404 HTML
+                if file ib_package.archive | grep -qE 'XZ|Zstandard|compressed'; then
+                  echo "==> 文件校验成功，正在解压 ImageBuilder..."
+                  if [[ "$IB_FILE" == *.zst ]]; then
+                    tar --zstd -xf ib_package.archive -C builder --strip-components=1
+                  else
+                    tar -xf ib_package.archive -C builder --strip-components=1
+                  fi
+                  rm -f ib_package.archive
+                  DOWNLOAD_SUCCESS=true
+                  break 2
+                else
+                  echo "下载的文件非有效压缩包 (404/页面错误)，跳过并尝试下一个节点..."
+                  rm -f ib_package.archive
+                fi
+              fi
+            done
+          done
+
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "::error::未能在官方源中找到可用的 23.05 ImageBuilder 下载包！"
+            exit 1
+          fi
+
+      # 4. 集成 AdGuard Home 二进制 (ARM64)
+      - name: Integrate AdGuard Home Binary
         run: |
-          mkdir -p builder/files/usr/bin/AdGuardHome
+          mkdir -p builder/files/opt/AdGuardHome
           AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/${ADGUARD_VER}/AdGuardHome_linux_arm64.tar.gz"
           curl -sSL "$AGH_URL" | tar -zx -C /tmp/
-          mv /tmp/AdGuardHome/AdGuardHome builder/files/usr/bin/AdGuardHome/AdGuardHome
-          chmod +x builder/files/usr/bin/AdGuardHome/AdGuardHome
+          mv /tmp/AdGuardHome/AdGuardHome builder/files/opt/AdGuardHome/AdGuardHome
+          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
           rm -rf /tmp/AdGuardHome
 
-      # 5. 集成 luci-app-adguardhome 源码至 files 目录（含 init.d 服务、UCI 规则与 uci-defaults）
+      # 5. 集成 luci-app-adguardhome 界面与配置文件
       - name: Integrate luci-app-adguardhome Files
         run: |
           git clone --depth=1 https://github.com/rufengsuixing/luci-app-adguardhome.git /tmp/luci-app-adguardhome
           
-          # 创建对应的文件系统路径
           mkdir -p builder/files/etc/init.d
           mkdir -p builder/files/etc/config
           mkdir -p builder/files/etc/uci-defaults
           mkdir -p builder/files/usr/lib/lua/luci
           mkdir -p builder/files/www
           
-          # 提取 root 目录（包含 /etc/init.d/AdGuardHome、UCI 默认规则及 uci-defaults 注册脚本）
           if [ -d /tmp/luci-app-adguardhome/root ]; then
             cp -r /tmp/luci-app-adguardhome/root/* builder/files/
           fi
-          
-          # 提取 Lua 控制界面与 Web 页面
           if [ -d /tmp/luci-app-adguardhome/luasrc ]; then
             cp -r /tmp/luci-app-adguardhome/luasrc/* builder/files/usr/lib/lua/luci/
           fi
@@ -73,24 +115,23 @@ jobs:
             cp -r /tmp/luci-app-adguardhome/htdocs/* builder/files/www/
           fi
 
-          # 确保 init.d 和 uci-defaults 脚本拥有可执行权限
           chmod +x builder/files/etc/init.d/* 2>/dev/null || true
           chmod +x builder/files/etc/uci-defaults/* 2>/dev/null || true
           rm -rf /tmp/luci-app-adguardhome
 
-      # 6. 预设 UCI 默认配置（保证默认二进制路径与重定向正确）
+      # 6. 预设 UCI 默认配置
       - name: Create Default AdGuard Home UCI Config
         run: |
           mkdir -p builder/files/etc/config
           cat << 'EOF' > builder/files/etc/config/adguardhome
-          config adguardhome 'config'
-              option enabled '1'
-              option binpath '/usr/bin/AdGuardHome/AdGuardHome'
-              option workpath '/usr/bin/AdGuardHome'
-              option redirect_mode 'exchange'
-          EOF
+config adguardhome 'config'
+    option enabled '1'
+    option binpath '/opt/AdGuardHome/AdGuardHome'
+    option workpath '/opt/AdGuardHome'
+    option redirect_mode 'exchange'
+EOF
 
-      # 7. 执行打包（FW4 / nftables 软件栈，自动关联核心依赖项）
+      # 7. 执行打包 (FW4 / 23.05 对应 nftables 软件栈)
       - name: Build RootFS
         run: |
           cd builder
@@ -109,27 +150,26 @@ jobs:
 
           make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 归档包供 GitHub Artifacts 临时下载
+      # 8. 上传 RootFS 归档包
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-23.05.4-armvirt-64-rootfs
-          path: builder/bin/targets/armvirt/64/*rootfs.tar.gz
+          name: immortalwrt-23.05-arm64-rootfs
+          path: builder/bin/targets/*/*/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 30
 
-      # 9. 自动发布到 GitHub Release 页面 (使用 softprops/action-gh-release@v2)
+      # 9. 自动发布到 GitHub Release
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: ${{ github.ref_name }}
-          name: "ImmortalWrt 23.05.4 RootFS (${{ github.ref_name }})"
+          tag_name: ImmortalWrt-23.05-${{ github.run_id }}
+          name: "ImmortalWrt 23.05 RootFS (ARM64)"
           body: |
-            ### 自动化构建完成 (FW4 / 23.05.4)
-            - **固件版本**: ImmortalWrt ${{ env.IMMORTALWRT_VER }}
-            - **内核/架构**: armvirt/64
+            ### 自动化构建完成 (ImmortalWrt 23.05 / FW4)
             - **防火墙架构**: FW4 (nftables)
             - **集成组件**: AdGuard Home (${{ env.ADGUARD_VER }}), PassWall, SmartDNS, SoftEtherVPN, VLMCSD 等。
-          files: builder/bin/targets/armvirt/64/*rootfs.tar.gz
+          files: builder/bin/targets/*/*/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
