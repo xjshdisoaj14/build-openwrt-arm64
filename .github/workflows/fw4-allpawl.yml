@@ -75,8 +75,14 @@ jobs:
           # 3) Daed (dae UI)
           download_latest_assets "daed-project/daed-openwrt" || true
 
-          # 4) PassWall2 (xiaorouji 维护版本)
-          download_latest_assets "xiaorouji/openwrt-passwall2" || true
+          # 4) PassWall2 (精准提取包并解压 zip 中的 apk 文件)
+          PW2_ZIP_URL=$(curl -sL "https://api.github.com/repos/xiaorouji/openwrt-passwall2/releases/latest" | jq -r '.assets[].browser_download_url' | grep -iE '\.zip$' | head -n 1)
+          if [ -n "$PW2_ZIP_URL" ]; then
+            echo "正在下载 PassWall2 离线压缩包: $PW2_ZIP_URL"
+            curl -sSL "$PW2_ZIP_URL" -o passwall2.zip
+            unzip -o passwall2.zip
+            rm -f passwall2.zip
+          fi
 
           # 处理解压：遇到 tar.gz / zip 压缩包，解压后提取 apk 放置于 packages 根目录
           for archive in *.tar.gz *.zip; do
@@ -132,8 +138,6 @@ jobs:
         run: |
           cd builder
 
-          # 追加说明：
-          # 1. 增加了 passwall2, luci-app-passwall2, luci-i18n-passwall2-zh-cn 及相关基础依赖（xray-core、sing-box等由其依赖项自动处理或打入包中）
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -142,7 +146,7 @@ jobs:
             nikki luci-app-nikki luci-i18n-nikki-zh-cn \
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
             daed luci-app-daed \
-            passwall2 luci-app-passwall2 luci-i18n-passwall2-zh-cn \
+            luci-app-passwall2 luci-i18n-passwall2-zh-cn \
             luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
