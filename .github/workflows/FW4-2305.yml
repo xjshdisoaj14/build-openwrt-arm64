@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 23.05 (FW4)
+name: Build ImmortalWrt 23.05 (FW4 2305)
 
 on:
   workflow_dispatch:
