@@ -92,13 +92,45 @@ jobs:
           echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
           ls -la *.apk || echo "未找到 APK 文件！"
 
-      # 5. 提取主要组件与内核版本号
+      # 5. 生成自定义系统配置 (修复 uci: command not found 问题的关键)
+      - name: Inject Custom Configuration
+        run: |
+          # 创建 OpenWrt 文件系统预置目录
+          FILES_DIR="builder/files/etc/uci-defaults"
+          mkdir -p "$FILES_DIR"
+
+          # 注入首次开机初始化脚本 (运行在真正的 OpenWrt 内部，确保 uci 命令可用)
+          cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
+          #!/bin/sh
+
+          # 1. 配置语言与时区
+          uci set system.@system[0].timezone='CST-8'
+          uci set system.@system[0].zonename='Asia/Shanghai'
+          uci commit system
+
+          # 2. 启用 vlmcsd (KMS 服务)
+          if [ -f /etc/config/vlmcsd ]; then
+            uci set vlmcsd.config.enabled='1'
+            uci commit vlmcsd
+          fi
+
+          # 3. 启用服务自启（软链接方式兜底）
+          [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
+          [ -f /etc/init.d/nikki ] && /etc/init.d/nikki enable
+          [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns enable
+
+          exit 0
+          EOF
+
+          chmod +x "$FILES_DIR/99-custom-init.sh"
+
+      # 6. 提取主要组件与内核版本号
       - name: Collect Software Versions
         run: |
           # 1. 提取内核版本号
           KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
 
-          # 2. 提取离线包版本号 (采用兼容性更好的截取算法)
+          # 2. 提取离线包版本号
           cd builder/packages
           GET_VER() {
             local pattern=$1
@@ -140,12 +172,12 @@ jobs:
           - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-tun、curl、wget-ssl、yq
           EOF
 
-      # 6. 打包 RootFS
+      # 7. 打包 RootFS
       - name: Build RootFS
         run: |
           cd builder
 
-          # 构建包清单 (修正了依赖冲突包的强行卸载行为)
+          # 包含预置 custom files (包含 uci-defaults 初始化脚本)
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
@@ -157,10 +189,9 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          # ARMSR 架构的 Target Profile 通常为 generic
-          make image PROFILE="generic" PACKAGES="$PACKAGES" -j$(nproc)
+          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 7. 上传 RootFS 编译产物到 Artifacts
+      # 8. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -169,7 +200,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 8. 发布编译产物到 GitHub Releases
+      # 9. 发布编译产物到 GitHub Releases
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
