@@ -15,7 +15,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链（纯净版 Ubuntu 标准依赖，不含不存在的 apk 包）
+      # 2. 准备编译工具链
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
@@ -24,23 +24,41 @@ jobs:
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd \
             gawk qemu-utils dosfstools mtools jq unzip openssl libc6:i386 libstdc++6:i386
 
-      # 3. 下载并解压 OECT 专属 ImageBuilder (meson/s80x)
+      # 3. 动态探测并下载 ImageBuilder (增加多路径兼容与强力正则)
       - name: Download & Extract ImageBuilder for OECT
         run: |
-          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/meson/s80x/"
-          echo "Connecting to OECT target repository: ${TARGET_DIR}"
+          # 候选 Target 路径列表（按优先级排序）
+          PATHS=(
+            "https://downloads.immortalwrt.org/releases/25.12.1/targets/meson/meson8b/"
+            "https://downloads.immortalwrt.org/releases/25.12.1/targets/meson/s80x/"
+            "https://downloads.immortalwrt.org/releases/25.12.1/targets/amlogic/s805/"
+          )
 
-          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+          IB_FILE=""
+          SELECTED_URL=""
+
+          for TARGET_DIR in "${PATHS[@]}"; do
+            echo "尝试连接目录: ${TARGET_DIR}"
+            HTML_CONTENT=$(curl -sL "$TARGET_DIR" || true)
+            
+            # 使用广度匹配解析文件名
+            IB_NAME=$(echo "$HTML_CONTENT" | grep -i 'imagebuilder' | grep -oE 'immortalwrt-imagebuilder-[^" ]+\.tar\.(zst|xz)' | head -n 1 || true)
+            
+            if [ -n "$IB_NAME" ]; then
+              IB_FILE="$IB_NAME"
+              SELECTED_URL="${TARGET_DIR}${IB_FILE}"
+              echo "✅ 成功匹配到 ImageBuilder: ${SELECTED_URL}"
+              break
+            fi
+          done
 
           if [ -z "$IB_FILE" ]; then
-            echo "::error::未能在 meson/s80x 找到 ImageBuilder 下载包！"
+            echo "::error::在所有已知 Target 目录中均未定位到 ImageBuilder 包！"
             exit 1
           fi
 
-          DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
-          echo "Downloading OECT ImageBuilder from: ${DOWNLOAD_URL}"
-
-          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
+          echo "Downloading from: ${SELECTED_URL}"
+          curl -sL "$SELECTED_URL" -o ib_package.archive
           mkdir -p builder
 
           if [[ "$IB_FILE" == *.zst ]]; then
@@ -102,7 +120,7 @@ jobs:
           download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || true
           download_assets "asv1st/luci-app-adguardhome" "adguardhome|luci" || true
 
-          # 解压压缩包
+          # 解压并扁平化存放
           for archive in *.zip *.tar.gz *.tgz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -113,10 +131,9 @@ jobs:
             rm -f "$archive"
           done
 
-          # 扁平化存放
           find . -mindepth 2 -type f \( -name "*.apk" -o -name "*.ipk" \) -exec mv -n {} . \; 2>/dev/null || true
 
-          # 剔除非 ARM32 包（玩客云为 ARMv7 / 32位 架构）
+          # 剔除非 ARM32 包（玩客云为 ARMv7 架构）
           for pkg_file in *.apk *.ipk; do
             [ -f "$pkg_file" ] || continue
             case "$pkg_file" in
@@ -128,26 +145,26 @@ jobs:
 
           cd ..
 
-          # 将本地包路径追加到 repositories.conf，并加上 --allow-untrusted 标识
+          # 将本地包路径追加到 repositories.conf，附加 --allow-untrusted 跳过校验
           LOCAL_REPO_URL="--allow-untrusted file://${PWD}/packages"
           echo "$LOCAL_REPO_URL" >> repositories.conf
 
-          # 使用 ImageBuilder 内部命令生成索引
+          # 使用 ImageBuilder 内部命令建立包索引
           make package_index || true
 
           # 配置 RootFS 内置 apk 允许未签名安装
           printf 'allow_untrusted = true\n' > files/etc/apk/apk.conf
 
-      # 5. 构建玩客云 (OECT) 固件
+      # 5. 构建玩客云 (OECT / OneCloud) 固件
       - name: Build OECT Image
         run: |
           cd builder
 
-          # 环境变量透传免签选项
           export APK="apk --allow-untrusted"
           export APK_ARGS="--allow-untrusted"
           export EXTRA_APK_ARGS="--allow-untrusted"
 
+          # 适合玩客云 512M 内存的精简组件列表
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -161,7 +178,8 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun"
 
-          PROFILE_NAME=$(make info | grep -oE 'xunlei_onecloud|onecloud' | head -n 1)
+          # 动态获取 Profile 名称
+          PROFILE_NAME=$(make info | grep -oE 'xunlei_onecloud|onecloud|onecloud-oect' | head -n 1)
           if [ -z "$PROFILE_NAME" ]; then
             PROFILE_NAME="xunlei_onecloud"
           fi
@@ -174,12 +192,12 @@ jobs:
             EXTRA_APK_ARGS="--allow-untrusted" \
             -j$(nproc)
 
-      # 6. 上传产物
+      # 6. 上传编译产物
       - name: Upload OECT Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-25.12.1-oect-onecloud
-          path: builder/bin/targets/meson/s80x/*
+          path: builder/bin/targets/*/*/*
           if-no-files-found: error
           retention-days: 7
 
@@ -192,8 +210,7 @@ jobs:
           name: ImmortalWrt 25.12.1 for OECT (OneCloud)
           body: |
             ## OECT (玩客云 OneCloud) 专用固件
-            - **Target**: `meson/s80x`
-            - **Profile**: `xunlei_onecloud`
-          files: builder/bin/targets/meson/s80x/*
+            - **特点**: 基于 25.12.1 适配 S805 平台，集成基础代理与 DNS 优化套件。
+          files: builder/bin/targets/*/*/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
