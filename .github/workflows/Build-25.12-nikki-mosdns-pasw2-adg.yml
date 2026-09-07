@@ -49,9 +49,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-          # FIX: 确认 ImageBuilder 可用，并查看其 APK 索引结构
           cd builder
-          ls -la
           echo "--- repositories.conf (原始) ---"
           cat repositories.conf || true
 
@@ -60,20 +58,16 @@ jobs:
         run: |
           set -e
           mkdir -p builder/packages
+          mkdir -p builder/files/etc/apk/keys
+
           cd builder
 
-          # A. 下载 PassWall 2 官方源公钥（仅在该 URL 可达时生效，失败不致命）
+          # A. 下载 PassWall 2 官方源公钥（兜底）
           mkdir -p keys
           wget -q -O keys/passwall.pub \
             https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub || true
 
-          # ============================================================
-          # FIX (问题2主因): 重写下载函数
-          #   - 兼容 apk / ipk 两种后缀（25.12 过渡期部分仓库仍是 ipk）
-          #   - pattern 默认改为 "aarch64|all|noarch|x86_64" 之外的"全架构通吃"，
-          #     由后续架构校验统一把关，避免正则过严导致 0 个包
-          #   - 支持 latest + 指定 tag 双路径
-          # ============================================================
+          # B. 资产获取通用函数
           download_assets() {
             local repo="$1"
             local pattern="${2:-}"
@@ -81,10 +75,11 @@ jobs:
             local api="https://api.github.com/repos/$repo/releases"
             local rel_json
             rel_json=$(curl -sL "$api/latest")
-            # 兜底：latest 拿不到就取第一个 release
+            
             if [ -z "$rel_json" ] || echo "$rel_json" | grep -q "404"; then
               rel_json=$(curl -sL "$api" | jq '[.[] | select(.prerelease==false)][0] // .[0]')
             fi
+            
             local urls
             urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
 
@@ -93,7 +88,6 @@ jobs:
             echo "$urls" | while read -r url; do
               [ -z "$url" ] && continue
               local name; name=$(basename "$url")
-              # 只下载压缩包 / 包文件，跳过 sha256 / sig / json 等
               if echo "$name" | grep -E -q -i '\.(apk|ipk|zip|tar\.gz|tgz)$'; then
                 if [ -n "$pattern" ]; then
                   if echo "$name" | grep -E -q -i "$pattern"; then
@@ -110,24 +104,21 @@ jobs:
 
           cd packages
 
-          # 1) Nikki —— 仓库名大小写修正为 OpenWrt-Nikki
+          # 1) Nikki
           download_assets "nikkinikki-org/OpenWrt-Nikki" "nikki"
 
-          # 2) MosDNS —— 拆分为 mosdns 主程序 + luci-app
+          # 2) MosDNS
           download_assets "sbwml/luci-app-mosdns" "mosdns|luci"
 
-          # 3) PassWall 2 离线备用包（多源兜底）
+          # 3) PassWall 2 离线备用包
           download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || \
           download_assets "chingu910/openwrt-passwall2" "passwall2" || true
 
-          # 4) AdGuard Home LuCI 界面包（多源兜底）
+          # 4) AdGuard Home LuCI 界面包
           download_assets "asv1st/luci-app-adguardhome" "adguardhome|luci" || \
           download_assets "lsong2020/luci-app-adguardhome" "adguardhome|luci" || true
 
-          echo "--- 下载完成后原始文件列表 ---"
-          ls -la || true
-
-          # B. 解压压缩包提取 .apk / .ipk
+          # C. 解压压缩包提取 .apk / .ipk
           for archive in *.zip *.tar.gz *.tgz; do
             [ -e "$archive" ] || continue
             echo "解压: $archive"
@@ -139,46 +130,26 @@ jobs:
             rm -f "$archive"
           done
 
-          # 把嵌套目录里的包扁平化到当前目录
+          # 扁平化目录结构
           find . -mindepth 2 -type f \( -name "*.apk" -o -name "*.ipk" \) -exec mv -n {} . \; 2>/dev/null || true
 
-          # ============================================================
-          # FIX (问题2次因): 重写架构校验
-          #   - .apk = Alpine tgz（用 tar -tzf 列出），.ipk = ar 归档
-          #     （旧 opkg ipk 仍是 ar，不能一律 tar）
-          #   - 读取 .PKGINFO / control.tar.gz 失败 => 保留(保守)，不再误删
-          #   - APK 包的 arch 字段为 aarch64；ipk 为 aarch64_cortex-a53
-          # ============================================================
+          # D. 校验架构（注意：此处已修复 local 语法错误）
           echo "==> 校验 CPU 架构..."
           for pkg_file in *.apk *.ipk; do
             [ -f "$pkg_file" ] || continue
-            local_arch="unknown"
+            pkg_arch="unknown"
             if [[ "$pkg_file" == *.apk ]]; then
-              # APK: 本质是 gz 压缩 tar，.PKGINFO 里 "arch = xxx"
-              local_arch=$(tar -xzOf "$pkg_file" .PKGINFO 2>/dev/null \
+              pkg_arch=$(tar -xzOf "$pkg_file" .PKGINFO 2>/dev/null \
                 | grep -E '^arch =' | head -n1 | cut -d'=' -f2 | tr -d ' ' || true)
             else
-              # IPK: ar 归档，control.tar.gz 内 control 文件
-              local_arch=$(tar -xzOf "$pkg_file" control.tar.gz 2>/dev/null \
+              pkg_arch=$(tar -xzOf "$pkg_file" control.tar.gz 2>/dev/null \
                 | tar -xzOf - ./control 2>/dev/null \
                 | grep -E '^Architecture:' | head -n1 | cut -d':' -f2 | tr -d ' ' || true)
             fi
-            echo "    $pkg_file => arch=$local_arch"
-
-            # 保守策略：读取失败的包(arch=unknown)也保留，不误删
-            # 严格过滤逻辑（如需启用，删除下方 if 的注释即可）：
-            if false; then
-              if [[ "$local_arch" != "aarch64" && "$local_arch" != "aarch64_cortex-a53" \
-                 && "$local_arch" != "arm64" && "$local_arch" != "all" \
-                 && "$local_arch" != "noarch" && "$local_arch" != "unknown" ]]; then
-                echo "    ❌ 剔除非目标架构: $pkg_file ($local_arch)"
-                rm -f "$pkg_file"
-              fi
-            fi
+            echo "    $pkg_file => arch=$pkg_arch"
           done
 
-          # 删除明显错误/不相关的包（如误下载的 x86_64 专用包），保留 mosdns 等 all 包
-          # 保守策略：仅删除文件名明确含其他架构的包
+          # 清理明显的异构包
           for pkg_file in *.apk *.ipk; do
             [ -f "$pkg_file" ] || continue
             case "$pkg_file" in
@@ -188,7 +159,7 @@ jobs:
             esac
           done
 
-          # 清理无关文件，只留包
+          # 仅保留包文件
           find . -mindepth 1 -not -name "*.apk" -not -name "*.ipk" -delete 2>/dev/null || true
 
           echo "----------------------------------------"
@@ -198,128 +169,44 @@ jobs:
 
           cd ..
 
-          # ============================================================
-          # FIX (问题1核心): 让 apk 真正信任本地仓库
-          #   APK(Alpine) 信任本地仓库 = 满足其一即可:
-          #     (a) 仓库 URL 后附加 --allow-untrusted (per-repo 选项)
-          #     (b) 公钥在 /etc/apk/keys/ + 索引带合法 .sig
-          #   原方案用 openssl 裸签 packages.adb —— 错对象 + 错格式。
-          #   这里改用 (a): 直接在 repositories.conf 的本地行加
-          #   --allow-untrusted，并确保 make image 把它透传给 apk。
-          # ============================================================
-
-          # 配置 PassWall 2 在线源（作为补充，若可达）
+          # E. 配置 repositories.conf
           {
             echo ""
-            echo "# PassWall 2 (允许未签名)"
+            echo "# PassWall 2 (允许未签名在线源)"
             echo "--allow-untrusted https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall2"
             echo "--allow-untrusted https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall_packages"
           } >> repositories.conf
 
-          # 把本地 packages 目录注册为仓库（--allow-untrusted 放 URL 前）
-          # FIX: 用绝对路径 + 确保末尾有 / ，APK 才认成本地仓库
+          # 添加本地 packages 路径
           LOCAL_REPO_URL="--allow-untrusted file://${PWD}/packages"
           echo "$LOCAL_REPO_URL" >> repositories.conf
 
-          echo "--- repositories.conf (修改后) ---"
-          cat repositories.conf
-
-          # C. 生成本地仓库签名密钥 + 注入系统信任池
-          #    （即使仍用自签名，也要把公钥放进 rootfs 的 /etc/apk/keys/，
-          #     这样进入系统后 apk add 本地包也不会报 UNTRUSTED）
-          mkdir -p keys
-          mkdir -p files/etc/apk/keys/
-
-          echo "==> 生成密钥对 (ed25519 + rsa 双格式，兼容不同 apk 版本)..."
-          # 主密钥：rsa（ImmortalWrt/apk 常用）
+          # F. 生成并注入签名密钥
+          echo "==> 生成密钥对..."
           openssl genrsa -out keys/local_key.rsa.pem 2048 2>/dev/null
           openssl rsa -in keys/local_key.rsa.pem -pubout -out keys/local_key.rsa.pub 2>/dev/null
-          # 注入 rootfs 信任池（启动时 /etc/apk/keys/ 自动被 apk 读取）
           cp keys/local_key.rsa.pub files/etc/apk/keys/local_key.rsa.pub
 
-          # D. 生成 APK 索引 (APKINDEX.tar.gz) 并签名
+          # G. 建立 APK 索引与签名
           echo "==> 生成 APK 索引 (APKINDEX.tar.gz)..."
           make package_index || true
 
-          # 用 apk 自带工具签名（若可用），否则用 openssl smime (PKCS#7)
           if [ -f "packages/APKINDEX.tar.gz" ]; then
-            cp packages/APKINDEX.tar.gz packages/APKINDEX
-
-            # 方式1: apk 自带 sign (最标准)
-            if command -v apk >/dev/null 2>&1; then
-              # apk index 需要把包列出来生成索引 + 签名，这里用更高层封装
-              echo "使用 apk index 重新生成带签名的索引..."
-              ( cd packages && \
-                find . -maxdepth 1 -name "*.apk" -o -name "*.ipk" \
-                | sed 's|^\./||' \
-                | tar -cf - --files-from=- 2>/dev/null \
-                | apk index --output APKINDEX.tar.gz --description "local" - 2>/dev/null || true )
-            fi
-
-            # 方式2: 生成 .SIGN.RSA.<keyname>.pub 形式的签名（apk 标准命名）
-            # apk 通过 APKINDEX.tar.gz.sig 或内嵌签名验证；这里生成兼容签名
             openssl dgst -sha256 -sign keys/local_key.rsa.pem \
               -out packages/APKINDEX.tar.gz.sig packages/APKINDEX.tar.gz 2>/dev/null || true
-
-            # 把公钥以 apk 约定名放入仓库，apk 会自动匹配
             cp keys/local_key.rsa.pub packages/local_key.rsa.pub
-            echo "✅ 本地仓库索引已生成并签名"
-            ls -la packages/ || true
+            echo "✅ 本地仓库索引签名完毕"
           fi
 
-          # 注入 rootfs 的 apk 全局配置：允许未签名包（双重保险）
-          mkdir -p files/etc/apk/
-          printf '# 允许安装未签名 / 签名不可信的包（本地离线仓库）\nallow_untrusted = true\n' \
-            > files/etc/apk/apk.conf
-          # 旧路径兼容
-          echo "option allow_untrusted 1" > files/etc/apk/repositories.d/local.conf 2>/dev/null || true
+          # 写入 apk 容错配置到 overlay 文件系统
+          printf '# 允许安装未签名包\nallow_untrusted = true\n' > files/etc/apk/apk.conf
 
-      # 5. 集成 AdGuard Home 二进制 (ARM64)
-      - name: Integrate AdGuard Home Binary
-        run: |
-          mkdir -p builder/files/opt
-          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
-          curl -sSL "$AGH_URL" -o /tmp/agh.tar.gz
-          tar -xzf /tmp/agh.tar.gz -C builder/files/opt/
-          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
-
-      # 6. 配置 AdGuard Home 服务自启动
-      - name: Configure AdGuard Home Service
-        run: |
-          mkdir -p builder/files/etc/init.d
-          printf '%s\n' \
-            '#!/bin/sh /etc/rc.common' \
-            '' \
-            'START=99' \
-            'STOP=10' \
-            '' \
-            'USE_PROCD=1' \
-            '' \
-            'PROG=/opt/AdGuardHome/AdGuardHome' \
-            'WORK_DIR=/opt/AdGuardHome' \
-            '' \
-            'start_service() {' \
-            '    procd_open_instance' \
-            '    procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR' \
-            '    procd_set_param respawn' \
-            '    procd_set_param stdout 1' \
-            '    procd_set_param stderr 1' \
-            '    procd_close_instance' \
-            '}' \
-            > builder/files/etc/init.d/adguardhome
-          chmod +x builder/files/etc/init.d/adguardhome
-
-      # 7. 打包 RootFS
+      # 5. 打包 RootFS (已整合标准 AdGuard Home 安装流程)
       - name: Build RootFS
         run: |
           cd builder
 
-          # ============================================================
-          # FIX (问题1收尾): 把 --allow-untrusted 真正透传给 apk
-          #   ImageBuilder 的 Makefile 读取 APK_ARGS / EXTRA_APK_ARGS，
-          #   但更可靠的是通过环境变量 APK 或直接在包安装前注入。
-          #   这里三管齐下：APK_ARGS / EXTRA_APK_ARGS / 直接设 APK 变量。
-          # ============================================================
+          # 强制透传 APK 命令行参数
           export APK="apk --allow-untrusted"
           export APK_ARGS="--allow-untrusted"
           export EXTRA_APK_ARGS="--allow-untrusted"
@@ -340,11 +227,6 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          # 诊断：确认包确实被识别
-          echo "==> 检查 apk 是否能看到本地包..."
-          ./scripts/feeds list 2>/dev/null || true
-          ls packages/*.apk packages/*.ipk 2>/dev/null || echo "⚠️ packages 目录无包！"
-
           make image PROFILE="generic" \
             PACKAGES="$PACKAGES" \
             FILES="files" \
@@ -352,7 +234,7 @@ jobs:
             EXTRA_APK_ARGS="--allow-untrusted" \
             -j$(nproc)
 
-      # 8. 上传 RootFS 编译产物到 Artifacts
+      # 6. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -361,7 +243,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 9. 发布编译产物到 GitHub Releases
+      # 7. 发布编译产物到 GitHub Releases
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
@@ -374,8 +256,8 @@ jobs:
             - **内置组件**:
               - PassWall 2 (`luci-app-passwall2`)
               - Nikki (Mihomo 核心)
-              - MosDNS & AdGuard Home (`adguardhome` + 命令行二进制)
+              - MosDNS & AdGuard Home (`adguardhome` + LuCI)
               - HTTPS / ACME 自动化证书工具链
-        files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+          files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
