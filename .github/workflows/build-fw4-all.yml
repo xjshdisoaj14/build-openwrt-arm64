@@ -15,12 +15,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链 (支持 zstd 与 xz)
+      # 2. 准备编译工具链 (必须安装 apk-tools 以支持 ImmortalWrt 25.12 的 APK 架构)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq apk-tools
 
       # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
       - name: Download & Extract ImageBuilder (25.12.1 Direct)
@@ -48,35 +48,45 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 精准获取并集成第三方离线包 (Nikki + MosDNS + Daed)
-      # 维持你原有的结构，只扩充拉取源，自动下载并解压 apk 到 builder/packages
+      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall 2)
       - name: Download & Integrate Offline Packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p builder/packages
           cd builder/packages
 
-          # 通用拉取函数：匹配 aarch64/arm64/all 的 apk 或压缩包
+          # 通用带 Token 鉴权的拉取函数
           download_latest_assets() {
             local repo=$1
             echo "==> 正在获取 $repo 的最新 Releases..."
-            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
-            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)')
+            local rel_json
+            rel_json=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/releases/latest")
+            local urls
+            urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
+            
+            if [ -z "$urls" ]; then
+              echo "::warning::未在 $repo 中找到可用的 package 资源，请检查 Releases。"
+              return 0
+            fi
+
             for url in $urls; do
               echo "正在下载: $url"
               curl -sSL -O "$url"
             done
           }
 
-          # 1) Nikki (内置 Mihomo 核心)
+          # 1) Nikki
           download_latest_assets "nikkinikki-org/OpenWrt-nikki"
 
-          # 2) MosDNS (sbwml 维护版本)
+          # 2) MosDNS
           download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 3) Daed (dae UI)
-          download_latest_assets "daed-project/daed-openwrt" || true
+          # 3) PassWall 2 专用仓库及依赖包
+          download_latest_assets "Openwrt-Passwall/openwrt-passwall2" || true
+          download_latest_assets "Openwrt-Passwall/openwrt-passwall-packages" || true
 
-          # 处理解压：遇到 tar.gz / zip 压缩包，解压后提取 apk 放置于 packages 根目录
+          # 解压压缩包提取内部 apk / ipk
           for archive in *.tar.gz *.zip; do
             if [ -f "$archive" ]; then
               tar -zxvf "$archive" 2>/dev/null || unzip -o "$archive" 2>/dev/null || true
@@ -84,11 +94,17 @@ jobs:
             fi
           done
 
-          # 确保解压到子目录里的 .apk 文件全部挪到 packages 根目录供 ImageBuilder 扫描
-          find . -mindepth 2 -name "*.apk" -exec mv {} . \;
+          # 归集所有 .apk / .ipk 文件到 packages 根目录
+          find . -mindepth 2 \( -name "*.apk" -o -name "*.ipk" \) -exec mv {} . \;
 
-          echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
-          ls -la *.apk || true
+          # 建立本地 APK 索引 (packages.adb)
+          if ls *.apk >/dev/null 2>&1; then
+            echo "==> 正在建立本地 APK 索引库..."
+            apk index -o packages.adb *.apk 2>/dev/null || true
+          fi
+
+          echo "当前已集成的离线 APK 清单："
+          ls -la *.apk 2>/dev/null || true
 
       # 5. 集成 AdGuard Home 二进制 (ARM64)
       - name: Integrate AdGuard Home Binary
@@ -103,53 +119,68 @@ jobs:
         run: |
           mkdir -p builder/files/etc/init.d
           cat << 'EOF' > builder/files/etc/init.d/adguardhome
-          #!/bin/sh /etc/rc.common
+#!/bin/sh /etc/rc.common
 
-          START=99
-          STOP=10
+START=99
+STOP=10
 
-          USE_PROCD=1
-          PROCD_DEBUG=1
+USE_PROCD=1
+PROCD_DEBUG=1
 
-          PROG=/opt/AdGuardHome/AdGuardHome
-          WORK_DIR=/opt/AdGuardHome
+PROG=/opt/AdGuardHome/AdGuardHome
+WORK_DIR=/opt/AdGuardHome
 
-          start_service() {
-              procd_open_instance
-              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
-              procd_set_param respawn
-              procd_set_param stdout 1
-              procd_set_param stderr 1
-              procd_close_instance
-          }
-          EOF
+start_service() {
+    procd_open_instance
+    procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+EOF
           chmod +x builder/files/etc/init.d/adguardhome
 
-      # 7. 打包 RootFS
+      # 7. 动态打包 RootFS
       - name: Build RootFS
         run: |
           cd builder
 
-          # 补充说明：
-          # 1. Nikki 已自带 Mihomo 核心，无需单独写 mihomo 包；
-          # 2. 增加 HTTPS/ACME 自动化证书工具包 (luci-app-acme, openssl-util 等)；
-          # 3. 补全 MosDNS / Daed / Nikki 对应的标准包名。
-          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+          # 动态解析本地 packages 目录下的第三方 APK 包名
+          LOCAL_PKGS=""
+          if ls packages/*.apk >/dev/null 2>&1; then
+            for f in packages/*.apk; do
+              P_NAME=$(apk info --pkgname "$f" 2>/dev/null || true)
+              if [ -n "$P_NAME" ]; then
+                LOCAL_PKGS="$LOCAL_PKGS $P_NAME"
+              fi
+            done
+          fi
+
+          echo "自动识别并加载的本地离线包名:$LOCAL_PKGS"
+
+          # 说明：
+          # 1. 包含 luci-app-uhttpd + luci-i18n-uhttpd-zh-cn（Web控制界面可自由开关 HTTP/HTTPS 和重定向）；
+          # 2. 移除 daed 及 luci-i18n-acme-zh-cn；
+          # 3. 预装 PassWall 2 所需的底层核心组件（xray-core / sing-box / chinadns-ng 等）。
+          BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            nikki luci-app-nikki luci-i18n-nikki-zh-cn \
-            mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-            daed luci-app-daed \
-            luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone \
+            luci-app-uhttpd luci-i18n-uhttpd-zh-cn \
+            luci-app-acme openssl-util px5g-standalone \
+            xray-core sing-box chinadns-ng ipt2socks tcping geoview \
+            luci-app-adguardhome luci-i18n-adguardhome-zh-cn \
             luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          make image PROFILE="" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          ALL_PACKAGES="$BASE_PACKAGES $LOCAL_PKGS"
+
+          make image PROFILE="" PACKAGES="$ALL_PACKAGES" FILES="files" -j$(nproc)
 
       # 8. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
@@ -171,10 +202,11 @@ jobs:
             ## ImmortalWrt 25.12.1 (ARMSR / armv8) 自动构建
             - **架构 / 包管理器**: ARMSR (ARM64) / APK
             - **内置组件**: 
+              - PassWall 2 (包含 Xray / Sing-box / ChinaDNS-NG)
               - Nikki (Mihomo 核心)
               - MosDNS & AdGuard Home
-              - Daed 代理前端
-              - HTTPS / ACME 自动化证书工具链
+              - Web HTTP/HTTPS 控制面板 (uHTTPd 管理开关 + SSL 支持)
+              - ACME 证书工具链
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
