@@ -15,20 +15,31 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链并安装 Alpine apk 静态二进制
+      # 2. 准备编译工具链并动态下载 Alpine apk 静态二进制 (修复 404)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-          # 安装 Alpine apk.static，解决 Ubuntu 无 apt-tools 问题
+          # 动态获取 Alpine 镜像站最新的 apk-tools-static 文件名，防止版本号更新引发 404
+          ALPINE_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/"
+          APK_FILE=$(curl -fsSL "$ALPINE_REPO" | grep -oE 'apk-tools-static-[0-9.]+-r[0-9]+\.apk' | head -n 1)
+
+          if [ -z "$APK_FILE" ]; then
+            echo "::error::无法解析 Alpine apk-tools-static 文件地址！"
+            exit 1
+          fi
+
+          echo "正在下载 APK 静态工具: ${ALPINE_REPO}${APK_FILE}"
+          curl -fsSL "${ALPINE_REPO}${APK_FILE}" -o /tmp/apk-static.apk
           mkdir -p /tmp/apk-setup
-          curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/apk-tools-static-3.20.0-r0.apk" | tar -xz -C /tmp/apk-setup
+          tar -xzf /tmp/apk-static.apk -C /tmp/apk-setup
           sudo cp /tmp/apk-setup/sbin/apk.static /usr/local/bin/apk
           sudo chmod +x /usr/local/bin/apk
-          rm -rf /tmp/apk-setup
-          echo "APK Tool 版本:"
+          rm -rf /tmp/apk-setup /tmp/apk-static.apk
+
+          echo "APK Tool 安装成功，版本信息："
           apk --version
 
       # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
@@ -65,7 +76,7 @@ jobs:
           mkdir -p builder/packages
           cd builder/packages
 
-          # 带 Token 鉴权的安全下载函数
+          # 带 Token 鉴权的 GitHub Release 资源下载函数
           download_latest_assets() {
             local repo=$1
             echo "==> 正在获取 $repo 的最新 Releases..."
@@ -117,7 +128,7 @@ jobs:
           echo "当前已集成的离线包清单："
           ls -la *.apk 2>/dev/null || true
 
-      # 5. 集成 AdGuard Home 二进制 (ARM64) - 增加校验与落地保护
+      # 5. 集成 AdGuard Home 二进制 (ARM64)
       - name: Integrate AdGuard Home Binary
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -128,11 +139,11 @@ jobs:
           AGH_URL=$(echo "$AGH_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E 'AdGuardHome_linux_arm64\.tar\.gz' | head -n 1)
 
           if [ -z "$AGH_URL" ]; then
-            echo "::warning::自动获取最新链接失败，使用备用稳定版 AdGuard Home 链接..."
+            echo "::warning::自动获取最新链接失败，使用静态备份链接..."
             AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.56/AdGuardHome_linux_arm64.tar.gz"
           fi
 
-          echo "正在从以下地址下载 AdGuard Home: $AGH_URL"
+          echo "正在下载 AdGuard Home: $AGH_URL"
           curl -fsSL "$AGH_URL" -o /tmp/agh.tar.gz
           
           tar -zxvf /tmp/agh.tar.gz -C /tmp/
@@ -172,7 +183,7 @@ jobs:
         run: |
           cd builder
 
-          # 自动读取本地离线包包名
+          # 读取本地离线包包名
           LOCAL_PKGS=""
           if ls packages/*.apk >/dev/null 2>&1; then
             for f in packages/*.apk; do
