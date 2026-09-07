@@ -1,42 +1,44 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite + HTTPS)
+name: Build ImmortalWrt 25.12.1 for OECT (OneCloud)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build ImmortalWrt RootFS
+    name: Build OECT Custom Firmware
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      # 1. 拉取仓库代码
+      # 1. Checkout repository code
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链
+      # 2. Prepare build toolchain (Fixed i386 architecture support)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip openssl
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd \
+            gawk qemu-utils dosfstools mtools jq unzip openssl libc6:i386 libstdc++6:i386
 
-      # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
-      - name: Download & Extract ImageBuilder (25.12.1 Direct)
+      # 3. Direct extraction of ImageBuilder (OECT Target: meson/s80x)
+      - name: Download & Extract ImageBuilder for OECT
         run: |
-          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
-          echo "Connecting to target repository: ${TARGET_DIR}"
+          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/meson/s80x/"
+          echo "Connecting to OECT target repository: ${TARGET_DIR}"
 
           IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
-            echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
+            echo "::error::Failed to locate ImageBuilder package in meson/s80x!"
             exit 1
           fi
 
           DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
-          echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
+          echo "Downloading OECT ImageBuilder from: ${DOWNLOAD_URL}"
 
           curl -sL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
@@ -48,181 +50,118 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 精准获取离线包 + 追加 PassWall 在线源 (APK)
+          cd builder
+          echo "--- repositories.conf ---"
+          cat repositories.conf || true
+
+      # 4. Download offline packages + Build local repository
       - name: Download & Integrate Offline Packages
         run: |
+          set -e
           mkdir -p builder/packages
+          mkdir -p builder/files/etc/apk/keys
+
           cd builder
 
-          # A. 追加 PassWall 2 官方在线源 (改用无反人机校验的镜像, SourceForge 会被 Cloudflare 拦截)
-          cat <<'EOF' >> repositories.conf
-          https://mirrors.vsean.net/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/passwall2
-          https://mirrors.vsean.net/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/passwall_packages
-          EOF
-
-          cd packages
-
-          # B. 离线资产获取函数 (仅下载 .apk / .zip / .tar.gz)
+          # Asset retrieval function
           download_assets() {
-            local repo=$1
-            local pattern=$2
-            echo "==> 正在获取 $repo 的 Release 资产..."
-            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
-            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
+            local repo="$1"
+            local pattern="${2:-}"
+            echo "==> Fetching assets for $repo..."
+            local api="https://api.github.com/repos/$repo/releases"
+            local rel_json
+            rel_json=$(curl -sL "$api/latest")
+            
+            if [ -z "$rel_json" ] || echo "$rel_json" | grep -q "404"; then
+              rel_json=$(curl -sL "$api" | jq '[.[] | select(.prerelease==false)][0] // .[0]')
+            fi
+            
+            local urls
+            urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
 
-            [ -z "$urls" ] && return 0
+            [ -z "$urls" ] && { echo "    ⚠️  No assets found"; return 0; }
 
-            for url in $urls; do
-              if [ -n "$pattern" ]; then
-                if echo "$url" | grep -E -i "$pattern"; then
-                  echo "下载包: $url"
-                  curl -sSL -O "$url" || true
-                fi
-              else
-                if echo "$url" | grep -E -i '\.(apk|zip|tar\.gz)$'; then
-                  echo "下载包: $url"
+            echo "$urls" | while read -r url; do
+              [ -z "$url" ] && continue
+              local name; name=$(basename "$url")
+              if echo "$name" | grep -E -q -i '\.(apk|ipk|zip|tar\.gz|tgz)$'; then
+                if [ -n "$pattern" ]; then
+                  if echo "$name" | grep -E -q -i "$pattern"; then
+                    echo "    Downloading (matched): $name"
+                    curl -sSL -O "$url" || true
+                  fi
+                else
+                  echo "    Downloading (all): $name"
                   curl -sSL -O "$url" || true
                 fi
               fi
             done
           }
 
-          # 1) Nikki
-          download_assets "nikkinikki-org/OpenWrt-nikki"
-          # 2) MosDNS
-          download_assets "sbwml/luci-app-mosdns"
-          # 3) PassWall 2 离线备用包
-          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || download_assets "chingu910/openwrt-passwall2" "passwall2" || true
-          # 4) AdGuard Home LuCI 界面包
-          download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
+          cd packages
 
-          # C. 解压压缩包提取 .apk
-          for archive in *.zip *.tar.gz; do
+          # Download target packages
+          download_assets "nikkinikki-org/OpenWrt-Nikki" "nikki"
+          download_assets "sbwml/luci-app-mosdns" "mosdns|luci"
+          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || true
+          download_assets "asv1st/luci-app-adguardhome" "adguardhome|luci" || true
+
+          # Extract packed archives
+          for archive in *.zip *.tar.gz *.tgz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
               unzip -o "$archive" || true
-            elif [[ "$archive" == *.tar.gz ]]; then
-              tar -zxvf "$archive" || true
+            else
+              tar -xzf "$archive" || true
             fi
             rm -f "$archive"
           done
 
-          find . -mindepth 2 -name "*.apk" -exec mv {} . \; 2>/dev/null || true
-          rm -f *passwall_*.apk 2>/dev/null || true
+          # Flatten directory structure
+          find . -mindepth 2 -type f \( -name "*.apk" -o -name "*.ipk" \) -exec mv -n {} . \; 2>/dev/null || true
 
-          # D. 校验 CPU 架构 (仅保留 aarch64 / noarch / all / armv8)
-          echo "==> 校验 APK CPU 架构..."
-          for apk_file in *.apk; do
-            [ -f "$apk_file" ] || continue
-            ARCH=$(tar -xzOf "$apk_file" .PKGINFO 2>/dev/null | grep -E '^arch =' | awk -F'=' '{gsub(/ /,"",$2);print $2}' || echo "unknown")
-            [ -z "$ARCH" ] && ARCH="unknown"
-
-            if [[ "$ARCH" != "aarch64" && "$ARCH" != "noarch" && "$ARCH" != "all" && "$ARCH" != "armv8" ]]; then
-              echo "[剔除] 非 ARM64 包: $apk_file (架构: $ARCH)"
-              rm -f "$apk_file"
-            else
-              echo "[保留] $apk_file (架构: $ARCH)"
-            fi
+          # Filter out non-arm/non-armv7 architectures for OECT
+          for pkg_file in *.apk *.ipk; do
+            [ -f "$pkg_file" ] || continue
+            case "$pkg_file" in
+              *_x86_64_*|*_i386_*|*_aarch64_*|*_mips_*)
+                echo "    ❌ Removing non-ARM32 package: $pkg_file"
+                rm -f "$pkg_file" ;;
+            esac
           done
 
-          echo "----------------------------------------"
-          echo "本地集成 APK 列表："
-          ls -la *.apk 2>/dev/null || true
-          echo "----------------------------------------"
+          cd ..
 
-      # 5. 生成统一构建密钥并给所有本地包内嵌重签名 (彻底解决 UNTRUSTED)
-      - name: Sign Local APK Repository
-        run: |
-          cd builder
+          # Configure repositories.conf with local repository
+          LOCAL_REPO_URL="--allow-untrusted file://${PWD}/packages"
+          echo "$LOCAL_REPO_URL" >> repositories.conf
 
-          # 定位 ImageBuilder 内置的 apk-tools 签名工具
-          SIGN_BIN=$(find staging_dir -type f -name 'abuild-sign' 2>/dev/null | head -n 1)
-          KEYGEN_BIN=$(find staging_dir -type f -name 'abuild-keygen' 2>/dev/null | head -n 1)
-          echo "abuild-sign   : ${SIGN_BIN:-<not found>}"
-          echo "abuild-keygen : ${KEYGEN_BIN:-<not found>}"
+          # Generate signing keys
+          openssl genrsa -out keys/local_key.rsa.pem 2048 2>/dev/null
+          openssl rsa -in keys/local_key.rsa.pem -pubout -out keys/local_key.rsa.pub 2>/dev/null
+          cp keys/local_key.rsa.pub files/etc/apk/keys/local_key.rsa.pub
 
-          # A. 生成构建密钥对 key-build(私钥) / key-build.pub(公钥)
-          #    apk 信任约定: 公钥文件名须与签名 key name 一致, 统一命名为 key-build
-          if [ ! -f key-build ] || [ ! -f key-build.pub ]; then
-            echo "==> 生成本地构建密钥 key-build ..."
-            [ -n "$KEYGEN_BIN" ] && { printf 'key-build\n\n\n\n' | sh "$KEYGEN_BIN" -a -n key-build >/dev/null 2>&1 || true; }
-            # 兜底: keygen 不可用时用 openssl 直接生成 (apk 信任的即 RSA 公钥 PEM)
-            if [ ! -f key-build ]; then
-              openssl genrsa -out key-build 2048
-              openssl rsa -in key-build -pubout -out key-build.pub
-            fi
-          fi
-
-          [ -f key-build ]    || { echo "::error::无法生成 key-build 私钥"; exit 1; }
-          [ -f key-build.pub ] || { echo "::error::无法生成 key-build.pub 公钥"; exit 1; }
-
-          # B. 用同一把私钥给 packages/ 下所有第三方 apk 内嵌重签名
-          if [ -n "$SIGN_BIN" ]; then
-            echo "==> 使用 key-build 对本地 APK 内嵌重签名..."
-            sh "$SIGN_BIN" -k "$(pwd)/key-build" -p "$(pwd)/key-build.pub" packages/*.apk || true
-          else
-            echo "::warning::未找到 abuild-sign, 仅依赖 ADD_LOCAL_KEY 兜底"
-          fi
-
-          # C. 把公钥注入镜像信任池 (files/ 会被打进最终 rootfs -> /etc/apk/keys/)
-          mkdir -p files/etc/apk/keys
-          cp -f key-build.pub files/etc/apk/keys/key-build.pub
-          # 同时放入 IB keys/ 目录, 供 make package_index 及构建期验签
-          mkdir -p keys
-          cp -f key-build.pub keys/key-build.pub
-
-          # D. 重建本地仓库索引 packages.adb (由 key-build 签名, 与公钥配对)
-          echo "==> 重新生成 packages.adb 索引 (key-build 签名)..."
+          # Build index
           make package_index || true
 
-          # E. 确保 repositories.conf 含本地仓库条目 (IB 默认已有 /packages, 无则补)
-          grep -qE '^/packages' repositories.conf || printf '\n/packages\n' >> repositories.conf
+          if [ -f "packages/APKINDEX.tar.gz" ]; then
+            openssl dgst -sha256 -sign keys/local_key.rsa.pem \
+              -out packages/APKINDEX.tar.gz.sig packages/APKINDEX.tar.gz 2>/dev/null || true
+            cp keys/local_key.rsa.pub packages/local_key.rsa.pub
+          fi
 
-          echo "=== repositories.conf ==="
-          cat repositories.conf
-          echo "=== keys/ ==="
-          ls -la keys/ || true
+          printf '# Allow untrusted packages\nallow_untrusted = true\n' > files/etc/apk/apk.conf
 
-      # 6. 集成 AdGuard Home 二进制 (ARM64)
-      - name: Integrate AdGuard Home Binary
-        run: |
-          mkdir -p builder/files/opt
-          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
-          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
-          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
-
-      # 7. 配置 AdGuard Home 服务自启动
-      - name: Configure AdGuard Home Service
-        run: |
-          mkdir -p builder/files/etc/init.d
-          cat << 'EOF' > builder/files/etc/init.d/adguardhome
-          #!/bin/sh /etc/rc.common
-
-          START=99
-          STOP=10
-
-          USE_PROCD=1
-          PROCD_DEBUG=1
-
-          PROG=/opt/AdGuardHome/AdGuardHome
-          WORK_DIR=/opt/AdGuardHome
-
-          start_service() {
-              procd_open_instance
-              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
-              procd_set_param respawn
-              procd_set_param stdout 1
-              procd_set_param stderr 1
-              procd_close_instance
-          }
-          EOF
-          chmod +x builder/files/etc/init.d/adguardhome
-
-      # 8. 打包 RootFS
-      - name: Build RootFS
+      # 5. Build Image for OECT (Profile: xunlei_onecloud)
+      - name: Build OECT Image
         run: |
           cd builder
 
+          export APK="apk --allow-untrusted"
+          export APK_ARGS="--allow-untrusted"
+          export EXTRA_APK_ARGS="--allow-untrusted"
+
+          # Tailored package list for OECT hardware resources
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -232,45 +171,45 @@ jobs:
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
             luci-app-passwall2 luci-i18n-passwall2-zh-cn \
             adguardhome luci-app-adguardhome \
-            luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone \
-            luci-i18n-smartdns-zh-cn \
-            luci-app-vlmcsd \
-            luci-i18n-softethervpn-zh-cn \
+            luci-app-acme luci-i18n-acme-zh-cn openssl-util \
             curl wget-ssl ca-certificates \
-            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
+            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun"
 
-          # ADD_LOCAL_KEY=1: 把本地 key-build.pub 写入镜像 /etc/apk/keys/
-          # 配合上一步的内嵌重签名, 编译期与运行期验签均可通过
-          make image PROFILE="generic" \
+          # Detect profile name (xunlei_onecloud or onecloud)
+          PROFILE_NAME=$(make info | grep -oE 'xunlei_onecloud|onecloud' | head -n 1)
+          if [ -z "$PROFILE_NAME" ]; then
+            PROFILE_NAME="xunlei_onecloud"
+          fi
+          echo "Selected Profile: $PROFILE_NAME"
+
+          make image PROFILE="$PROFILE_NAME" \
             PACKAGES="$PACKAGES" \
             FILES="files" \
-            ADD_LOCAL_KEY=1 \
+            APK_ARGS="--allow-untrusted" \
+            EXTRA_APK_ARGS="--allow-untrusted" \
             -j$(nproc)
 
-      # 9. 上传 RootFS 编译产物到 Artifacts
-      - name: Upload RootFS Artifact
+      # 6. Upload OECT Firmware Artifacts
+      - name: Upload OECT Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-armsr-rootfs
-          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+          name: immortalwrt-25.12.1-oect-onecloud
+          path: builder/bin/targets/meson/s80x/*
           if-no-files-found: error
           retention-days: 7
 
-      # 10. 发布编译产物到 GitHub Releases
-      - name: Upload RootFS to GitHub Release
+      # 7. Release to GitHub
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: ImmortalWrt-25.12.1-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 ARMSR RootFS
+          tag_name: OECT-ImmortalWrt-${{ github.run_id }}
+          name: ImmortalWrt 25.12.1 for OECT (OneCloud)
           body: |
-            ## ImmortalWrt 25.12.1 (ARMSR / armv8) 自动构建
-            - **架构 / 包管理器**: ARMSR (ARM64) / APK
-            - **内置组件**:
-              - PassWall 2 (`luci-app-passwall2`)
-              - Nikki (Mihomo 核心)
-              - MosDNS & AdGuard Home (`adguardhome` + 命令行二进制)
-              - HTTPS / ACME 自动化证书工具链
-          files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+            ## OECT (玩客云 OneCloud) 专用固件构建
+            - **Target**: `meson/s80x`
+            - **Profile**: `xunlei_onecloud`
+            - **特性**: 专为玩客云硬件适配，已集成基本代理及 DNS 优化套件。
+          files: builder/bin/targets/meson/s80x/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
