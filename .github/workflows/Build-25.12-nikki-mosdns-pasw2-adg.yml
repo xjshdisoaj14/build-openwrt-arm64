@@ -1,0 +1,227 @@
+name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 国际标准时间 (UTC) 每偶数月 1 日 0:00 触发 (北京时间 08:00)
+    - cron: '0 0 1 */2 *'
+
+jobs:
+  build:
+    name: Build ImmortalWrt RootFS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. 准备编译工具链与依赖
+      - name: Prepare Build Tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get update
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
+
+      # 3. 提取 ImageBuilder
+      - name: Download & Extract ImageBuilder
+        run: |
+          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
+          echo "Connecting to target repository: ${TARGET_DIR}"
+
+          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+
+          if [ -z "$IB_FILE" ]; then
+            echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
+            exit 1
+          fi
+
+          DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
+          echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
+
+          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
+          mkdir -p builder
+
+          if [[ "$IB_FILE" == *.zst ]]; then
+            tar --zstd -xf ib_package.archive -C builder --strip-components=1
+          else
+            tar -xf ib_package.archive -C builder --strip-components=1
+          fi
+          rm -f ib_package.archive
+
+      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall2 + AdGuardHome)
+      - name: Download & Integrate Offline Packages
+        run: |
+          mkdir -p builder/packages
+          cd builder/packages
+
+          download_latest_assets() {
+            local repo=$1
+            echo "==> 正在获取 $repo 的最新 Releases..."
+            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
+            
+            for url in $urls; do
+              echo "正在下载: $url"
+              curl -sSL -O "$url"
+            done
+          }
+
+          # 1) Nikki
+          download_latest_assets "nikkinikki-org/OpenWrt-nikki"
+
+          # 2) MosDNS
+          download_latest_assets "sbwml/luci-app-mosdns"
+
+          # 3) PassWall2
+          download_latest_assets "xiaorouji/openwrt-passwall2"
+
+          # 4) AdGuardHome (LuCI App)
+          download_latest_assets "asv1st/luci-app-adguardhome"
+
+          # 解压可能包含在压缩包中的软件包
+          for archive in *.zip *.tar.gz; do
+            [ -e "$archive" ] || continue
+            if [[ "$archive" == *.zip ]]; then
+              unzip -o "$archive" || true
+            elif [[ "$archive" == *.tar.gz ]]; then
+              tar -zxvf "$archive" || true
+            fi
+            rm -f "$archive"
+          done
+
+          # 将嵌套子目录中的 apk 提升到 packages 根目录
+          find . -mindepth 2 -name "*.apk" -exec mv {} . \;
+
+          echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
+          ls -la *.apk || echo "未找到 APK 文件！"
+
+      # 5. 生成自定义系统配置 (修复 uci: command not found 问题的关键)
+      - name: Inject Custom Configuration
+        run: |
+          # 创建 OpenWrt 文件系统预置目录
+          FILES_DIR="builder/files/etc/uci-defaults"
+          mkdir -p "$FILES_DIR"
+
+          # 注入首次开机初始化脚本 (运行在真正的 OpenWrt 内部，确保 uci 命令可用)
+          cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
+          #!/bin/sh
+
+          # 1. 配置语言与时区
+          uci set system.@system[0].timezone='CST-8'
+          uci set system.@system[0].zonename='Asia/Shanghai'
+          uci commit system
+
+          # 2. 启用 vlmcsd (KMS 服务)
+          if [ -f /etc/config/vlmcsd ]; then
+            uci set vlmcsd.config.enabled='1'
+            uci commit vlmcsd
+          fi
+
+          # 3. 启用服务自启（软链接方式兜底）
+          [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
+          [ -f /etc/init.d/nikki ] && /etc/init.d/nikki enable
+          [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns enable
+          [ -f /etc/init.d/passwall2 ] && /etc/init.d/passwall2 enable
+          [ -f /etc/init.d/adguardhome ] && /etc/init.d/adguardhome enable
+
+          exit 0
+          EOF
+
+          chmod +x "$FILES_DIR/99-custom-init.sh"
+
+      # 6. 提取主要组件与内核版本号
+      - name: Collect Software Versions
+        run: |
+          # 1. 提取内核版本号
+          KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
+
+          # 2. 提取离线包版本号
+          cd builder/packages
+          GET_VER() {
+            local pattern=$1
+            local file=$(ls ${pattern}*.apk 2>/dev/null | head -n1)
+            if [ -n "$file" ]; then
+              echo "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$|\.apk$//'
+            else
+              echo "最新发布版"
+            fi
+          }
+
+          NIKKI_VER=$(GET_VER "nikki")
+          LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
+          MOSDNS_VER=$(GET_VER "mosdns")
+          PASSWALL2_VER=$(GET_VER "luci-app-passwall2")
+          ADG_VER=$(GET_VER "luci-app-adguardhome")
+
+          # 3. 获取北京时间 (UTC+8)
+          BUILD_DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
+
+          # 4. 写入环境变量
+          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
+
+          # 写入 Release Body 说明文件
+          cat <<EOF > $GITHUB_WORKSPACE/release_body.md
+          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版构建
+
+          - **构建日期**: $BUILD_DATE
+          - **构建 ID**: ${{ github.run_id }}
+          - **架构 / 包管理器**: ARMSR (ARM64) / APK
+
+          ### 📦 核心组件版本清单
+          - **Linux Kernel**: \`$KERNEL_VER\`
+          - **Nikki Core**: \`$NIKKI_VER\`
+          - **LuCI App Nikki**: \`$LUCI_NIKKI_VER\`
+          - **MosDNS**: \`$MOSDNS_VER\`
+          - **PassWall2**: \`$PASSWALL2_VER\`
+          - **AdGuard Home**: \`$ADG_VER\`
+
+          ### 🛠 集成软件列表
+          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall2、AdGuard Home
+          - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
+          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-tun、curl、wget-ssl、yq
+          EOF
+
+      # 7. 打包 RootFS
+      - name: Build RootFS
+        run: |
+          cd builder
+
+          # 包含预置 custom files (包含 uci-defaults 初始化脚本)
+          PACKAGES="luci \
+            luci-i18n-base-zh-cn \
+            luci-theme-argon \
+            vsftpd openssh-sftp-server \
+            nikki luci-app-nikki luci-i18n-nikki-zh-cn \
+            mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
+            passwall2 luci-app-passwall2 luci-i18n-passwall2-zh-cn \
+            adguardhome luci-app-adguardhome luci-i18n-adguardhome-zh-cn \
+            luci-app-vlmcsd \
+            luci-i18n-softethervpn-zh-cn \
+            curl wget-ssl ca-certificates \
+            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
+
+          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+
+      # 8. 上传 RootFS 编译产物到 Artifacts
+      - name: Upload RootFS Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-25.12.1-armsr-rootfs-optimize-${{ env.BUILD_DATE }}
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      # 9. 发布编译产物到 GitHub Releases
+      - name: Upload RootFS to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
+        with:
+          tag_name: ImmortalWrt-25.12.1-${{ env.BUILD_DATE }}-${{ github.run_id }}
+          name: ImmortalWrt 25.12.1 ARMSR RootFS Optimize (${{ env.BUILD_DATE }})
+          body_path: release_body.md
+          files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
