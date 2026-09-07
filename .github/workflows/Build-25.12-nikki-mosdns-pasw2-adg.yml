@@ -81,7 +81,7 @@ jobs:
           # 4) AdGuardHome (LuCI App)
           download_latest_assets "asv1st/luci-app-adguardhome"
 
-          # 解压可能包含在压缩包中的软件包
+          # 解压可能包含在 zip/tar.gz 压缩包中的 APK 文件
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -95,8 +95,10 @@ jobs:
           # 将嵌套子目录中的 apk 提升到 packages 根目录
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
+          echo "=========================================="
           echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
           ls -la *.apk || echo "未找到 APK 文件！"
+          echo "=========================================="
 
       # 5. 生成自定义系统配置 (修复 uci: command not found 问题的关键)
       - name: Inject Custom Configuration
@@ -146,7 +148,7 @@ jobs:
             if [ -n "$file" ]; then
               echo "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$|\.apk$//'
             else
-              echo "最新发布版"
+              echo "已打包/内置"
             fi
           }
 
@@ -181,7 +183,7 @@ jobs:
           ### 🛠 集成软件列表
           - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall2、AdGuard Home
           - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
-          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-tun、curl、wget-ssl、yq
+          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-nft-socket、kmod-tun、curl、wget-ssl、yq
           EOF
 
       # 7. 打包 RootFS
@@ -189,15 +191,15 @@ jobs:
         run: |
           cd builder
 
-          # 包含预置 custom files (包含 uci-defaults 初始化脚本)
+          # 修正后的包列表 (完全符合 25.12 APK 规范，剔除不存在的虚拟包/独立语言包)
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             nikki luci-app-nikki luci-i18n-nikki-zh-cn \
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-            passwall2 luci-app-passwall2 luci-i18n-passwall2-zh-cn \
-            adguardhome luci-app-adguardhome luci-i18n-adguardhome-zh-cn \
+            luci-app-passwall2 \
+            adguardhome luci-app-adguardhome \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
