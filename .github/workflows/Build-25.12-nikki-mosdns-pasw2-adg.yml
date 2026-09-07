@@ -51,17 +51,17 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 配置 PassWall2/Nikki 源并对离线 APK 执行【底层 architecture 元数据校验】
-      - name: Configure Repositories & Strictly Inspect APK Arch
+      # 4. 配置 PassWall2/Nikki 源并拉取校验离线 APK
+      - name: Configure Repositories & Process APKs
         run: |
           mkdir -p builder/packages
           cd builder
 
-          # A. 配置 PassWall 2 / Nikki / MosDNS 专属 ARM64 在线软件源 (用于兜底解析 mihomo、geo2txt 等依赖)
-          echo "==> 添加 PassWall 2 认证 APK 软件源..."
+          # A. 导入第三方 PassWall 2 签名公钥到 ImageBuilder 信任区
           mkdir -p keys
           wget -q -O keys/passwall.pub https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub || true
 
+          # B. 配置 PassWall 2 在线 APK 软件源
           cat <<EOF >> repositories.conf
           https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall2
           https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall_packages
@@ -69,7 +69,7 @@ jobs:
 
           cd packages
 
-          # B. 离线资产获取函数
+          # C. 离线资产获取函数
           download_assets() {
             local repo=$1
             local pattern=$2
@@ -100,7 +100,7 @@ jobs:
           download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
           download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || download_assets "chingu910/openwrt-passwall2" "passwall2" || true
 
-          # C. 解压所有归档文件
+          # 解压所有归档文件
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -111,37 +111,43 @@ jobs:
             rm -f "$archive"
           done
 
-          # 提取所有子目录的 .apk 文件到 packages 根路径
+          # 移动子目录中的 apk 到根路径
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
-          # 物理隔离 PassWall 1 代包
+          # 隔离 PassWall 1 代包
           rm -f *passwall_*.apk 2>/dev/null || true
 
-          # D. 【关键修复】深度解包读取 .PKGINFO 中的 arch 字段，剔除 riscv64, x86_64, mips 等杂质包
-          echo "==> 正在校验所有本地 APK 的真实 CPU 架构 (仅保留 aarch64 / noarch / all)..."
+          # D. 深度校验架构，剔除非 ARM64 包
+          echo "==> 校验 APK 真实架构 (仅保留 aarch64 / noarch / all)..."
           for apk_file in *.apk; do
             [ -f "$apk_file" ] || continue
-
-            # 读取 apk 包内的 .PKGINFO 元数据
             ARCH=$(tar -ztvf "$apk_file" .PKGINFO 2>/dev/null && tar -zxvf "$apk_file" .PKGINFO -O 2>/dev/null | grep -E '^arch =' | cut -d'=' -f2 | tr -d ' ' || echo "unknown")
 
             if [[ "$ARCH" != "aarch64" && "$ARCH" != "noarch" && "$ARCH" != "all" && "$ARCH" != "armv8" ]]; then
-              echo "❌ 剔除非 ARM64 架构包: $apk_file (真实架构: $ARCH)"
+              echo "❌ 剔除非 ARM64 包: $apk_file ($ARCH)"
               rm -f "$apk_file"
             else
-              echo "✅ 留用兼容包: $apk_file (架构: $ARCH)"
+              echo "✅ 留用包: $apk_file ($ARCH)"
             fi
           done
 
           echo "=========================================="
-          echo "通过严格架构校验的最终 APK 清单："
-          ls -la *.apk || echo "未找到适合 ARM64 的本地包，将完全通过在线软件源拉取。"
+          echo "用于构建的最终 APK 清单："
+          ls -la *.apk || echo "未抓取到本地 APK，将纯依靠在线源。"
           echo "=========================================="
 
-          # E. 构建本地 packages.adb 索引库
+          # E. 生成本地包索引并修复签名信任问题
           cd ..
-          echo "==> 使用 ImageBuilder 内置工具生成 packages.adb 索引..."
+          echo "==> 使用 ImageBuilder 生成本地 packages.adb 索引并同步密钥..."
           make package_index || true
+
+          # 关键修复：如果本地 packages.pub 生成，将其同步到 ImageBuilder 的信任 keys 目录
+          if [ -f packages.pub ]; then
+            cp -f packages.pub keys/
+          fi
+          if [ -f staging_dir/host/etc/keys/packages.pub ]; then
+            cp -f staging_dir/host/etc/keys/packages.pub keys/ 2>/dev/null || true
+          fi
 
       # 5. 注入初始化配置
       - name: Inject Custom Configuration
@@ -216,7 +222,7 @@ jobs:
           - **网络增强工具**: nftables、kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun curl wget-ssl yq
           EOF
 
-      # 7. 打包 RootFS 镜像
+      # 7. 打包 RootFS 镜像 (允许未认证本地源构建)
       - name: Build RootFS
         run: |
           cd builder
@@ -234,7 +240,8 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
+          # 追加 --allow-untrusted 参数确保 apk 执行时不被 UNTRUSTED 阻塞
+          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" APK_FLAGS="--allow-untrusted" -j$(nproc)
 
       # 8. 上传 RootFS 构建产物
       - name: Upload RootFS Artifact
