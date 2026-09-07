@@ -1,10 +1,7 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite + HTTPS)
 
 on:
   workflow_dispatch:
-  schedule:
-    # 每偶数月 1 日 0:00 UTC 自动构建
-    - cron: '0 0 1 */2 *'
 
 jobs:
   build:
@@ -14,19 +11,19 @@ jobs:
       contents: write
 
     steps:
-      # 1. 检出代码
+      # 1. 拉取仓库代码
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备构建环境 (安装 signing 工具 apk-tools / openssl)
+      # 2. 准备编译工具链
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip openssl apk-tools
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip openssl
 
-      # 3. 下载并解压 ImageBuilder
-      - name: Download & Extract ImageBuilder
+      # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
+      - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
@@ -51,17 +48,16 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 配置 PassWall2/Nikki 源，拉取 APK 并对本地索引执行签名
-      - name: Configure Repositories & Process APKs
+      # 4. 精准获取并集成第三方离线包 (Nikki + MosDNS + PassWall 2 + AdGuard Home)
+      - name: Download & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
           cd builder
 
-          # A. 导入第三方 PassWall 2 签名公钥
+          # A. 配置 PassWall 2 官方认证 APK 在线源并下载 Key
           mkdir -p keys
           wget -q -O keys/passwall.pub https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub || true
 
-          # B. 配置 PassWall 2 在线源
           cat <<EOF >> repositories.conf
           https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall2
           https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall_packages
@@ -69,11 +65,11 @@ jobs:
 
           cd packages
 
-          # C. 下载函数
+          # B. 离线资产获取函数
           download_assets() {
             local repo=$1
             local pattern=$2
-            echo "==> 抓取 $repo Release 资产..."
+            echo "==> 正在获取 $repo 的 Release 资产..."
             local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
             local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
 
@@ -94,12 +90,19 @@ jobs:
             done
           }
 
+          # 1) Nikki (内置 Mihomo 核心)
           download_assets "nikkinikki-org/OpenWrt-nikki"
+
+          # 2) MosDNS (sbwml 维护版)
           download_assets "sbwml/luci-app-mosdns"
-          download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
+
+          # 3) PassWall 2 离线备用包
           download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || download_assets "chingu910/openwrt-passwall2" "passwall2" || true
 
-          # 解压归档
+          # 4) AdGuard Home LuCI 界面包
+          download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
+
+          # C. 处理解压归档
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -110,128 +113,88 @@ jobs:
             rm -f "$archive"
           done
 
+          # 确保子目录内的 .apk 文件移动至 packages 根目录
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
+
+          # 剔除 1 代 Passwall 干扰包
           rm -f *passwall_*.apk 2>/dev/null || true
 
-          # D. 校验 CPU 架构
-          echo "==> 校验 APK 真实架构 (仅保留 aarch64 / noarch / all)..."
+          # D. 【关键逻辑】精准校验 CPU 架构，彻底清除 riscv64/x86 等非法包
+          echo "==> 正在校验所有本地 APK 的真实 CPU 架构 (仅保留 aarch64 / noarch / all)..."
           for apk_file in *.apk; do
             [ -f "$apk_file" ] || continue
             ARCH=$(tar -ztvf "$apk_file" .PKGINFO 2>/dev/null && tar -zxvf "$apk_file" .PKGINFO -O 2>/dev/null | grep -E '^arch =' | cut -d'=' -f2 | tr -d ' ' || echo "unknown")
 
             if [[ "$ARCH" != "aarch64" && "$ARCH" != "noarch" && "$ARCH" != "all" && "$ARCH" != "armv8" ]]; then
-              echo "❌ 剔除非 ARM64 包: $apk_file ($ARCH)"
+              echo "❌ 剔除非 ARM64 包: $apk_file (真实架构: $ARCH)"
               rm -f "$apk_file"
             else
-              echo "✅ 留用包: $apk_file ($ARCH)"
+              echo "✅ 留用兼容包: $apk_file (架构: $ARCH)"
             fi
           done
 
           echo "=========================================="
-          echo "用于构建的本地 APK 清单："
-          ls -la *.apk || echo "未找到任何本地包！"
+          echo "最终集成至 ImageBuilder 本地库的离线 APK 清单："
+          ls -la *.apk || true
           echo "=========================================="
 
-          # E. 生成本地索引 + 【关键修复：强行生成 RSA 签名并写入信任密钥区】
+          # E. 生成本地 packages.adb 索引并使用 usign 实施签名认证
           cd ..
-          echo "==> 生成本地 packages.adb 索引..."
+          echo "==> 生成本地包索引..."
           make package_index || true
 
-          echo "==> 为本地软件包索引生成自定义签名证书..."
-          openssl genrsa -out local_key.pem 2048
-          openssl rsa -in local_key.pem -pubout -out keys/local_key.rsa.pub
-          
-          # 使用 ImageBuilder 自带的 host 工具或系统 apk 签名 packages.adb
-          SIGN_TOOL="./staging_dir/host/bin/apk"
-          [ ! -f "$SIGN_TOOL" ] && SIGN_TOOL="apk"
-
-          if command -v $SIGN_TOOL >/dev/null 2>&1; then
-            $SIGN_TOOL adb sign --sign-key local_key.pem packages/packages.adb 2>/dev/null || \
-            $SIGN_TOOL mkndx --sign-key local_key.pem --output packages/packages.adb packages/*.apk 2>/dev/null || true
+          echo "==> 为本地索引套用临时密钥进行签名修复..."
+          STAGING_USIGN="./staging_dir/host/bin/usign"
+          if [ -f "$STAGING_USIGN" ]; then
+            $STAGING_USIGN -G -s key.sec -p keys/key.pub
+            $STAGING_USIGN -S -m packages/packages.adb -s key.sec -x packages/packages.adb.sig 2>/dev/null || true
           fi
 
-          # 在 repositories.conf 中增加允许未签名回退标记
-          echo "@untrusted $(pwd)/packages" >> repositories.conf
+          # 在 repositories.conf 开启全局未签名容忍选项
+          echo "option allow_untrusted 1" >> repositories.conf || true
 
-      # 5. 注入初始化配置
-      - name: Inject Custom Configuration
+      # 5. 集成 AdGuard Home 二进制 (ARM64)
+      - name: Integrate AdGuard Home Binary
         run: |
-          FILES_DIR="builder/files/etc/uci-defaults"
-          mkdir -p "$FILES_DIR"
+          mkdir -p builder/files/opt
+          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
+          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
+          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-          cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
-          #!/bin/sh
-
-          export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
-
-          if command -v uci >/dev/null 2>&1; then
-            uci set system.@system[0].timezone='CST-8'
-            uci set system.@system[0].zonename='Asia/Shanghai'
-            uci commit system
-
-            if [ -f /etc/config/vlmcsd ]; then
-              uci set vlmcsd.config.enabled='1'
-              uci commit vlmcsd
-            fi
-          fi
-
-          exit 0
-          EOF
-
-          chmod +x "$FILES_DIR/99-custom-init.sh"
-
-      # 6. 收集软件版本
-      - name: Collect Software Versions
+      # 6. 配置 AdGuard Home 服务自启动
+      - name: Configure AdGuard Home Service
         run: |
-          KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
+          mkdir -p builder/files/etc/init.d
+          cat << 'EOF' > builder/files/etc/init.d/adguardhome
+          #!/bin/sh /etc/rc.common
 
-          cd builder/packages
-          GET_VER() {
-            local pattern=$1
-            local file=$(ls ${pattern}*.apk 2>/dev/null | head -n1)
-            if [ -n "$file" ]; then
-              echo "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$|\.apk$//'
-            else
-              echo "源/自动拉取"
-            fi
+          START=99
+          STOP=10
+
+          USE_PROCD=1
+          PROCD_DEBUG=1
+
+          PROG=/opt/AdGuardHome/AdGuardHome
+          WORK_DIR=/opt/AdGuardHome
+
+          start_service() {
+              procd_open_instance
+              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
+              procd_set_param respawn
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
           }
-
-          NIKKI_VER=$(GET_VER "nikki")
-          LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
-          MOSDNS_VER=$(GET_VER "mosdns")
-          PASSWALL2_VER=$(GET_VER "luci-app-passwall2")
-          ADG_VER=$(GET_VER "luci-app-adguardhome")
-
-          BUILD_DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
-          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
-
-          cat <<EOF > $GITHUB_WORKSPACE/release_body.md
-          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版 RootFS
-
-          - **构建日期**: $BUILD_DATE
-          - **构建 ID**: ${{ github.run_id }}
-          - **架构 / 包管理器**: ARMSR (ARM64) / APK
-
-          ### 📦 核心组件版本清单
-          - **Linux Kernel**: \`$KERNEL_VER\`
-          - **Nikki Core**: \`$NIKKI_VER\`
-          - **LuCI App Nikki**: \`$LUCI_NIKKI_VER\`
-          - **MosDNS**: \`$MOSDNS_VER\`
-          - **PassWall 2**: \`$PASSWALL2_VER\`
-          - **AdGuard Home**: \`$ADG_VER\`
-
-          ### 🛠 集成软件列表
-          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall 2 (luci-app-passwall2)、AdGuard Home
-          - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
-          - **网络增强工具**: nftables、kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun curl wget-ssl yq
           EOF
+          chmod +x builder/files/etc/init.d/adguardhome
 
-      # 7. 打包 RootFS 镜像
+      # 7. 打包 RootFS
       - name: Build RootFS
         run: |
           cd builder
 
-          PACKAGES="luci \
+          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
+            luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
@@ -239,31 +202,39 @@ jobs:
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
             luci-app-passwall2 luci-i18n-passwall2-zh-cn \
             adguardhome luci-app-adguardhome \
+            luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone \
+            luci-i18n-smartdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          # 传入 --allow-untrusted 防止被遗留校验拦截
-          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" APK_ARGS="--allow-untrusted" APK_FLAGS="--allow-untrusted" -j$(nproc)
+          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" APK_FLAGS="--allow-untrusted" -j$(nproc)
 
-      # 8. 上传 RootFS 构建产物
+      # 8. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-armsr-rootfs-optimize-${{ env.BUILD_DATE }}
+          name: immortalwrt-25.12.1-armsr-rootfs
           path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 9. 发布 GitHub Release
+      # 9. 发布编译产物到 GitHub Releases
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
-        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: ImmortalWrt-25.12.1-${{ env.BUILD_DATE }}-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 ARMSR RootFS Optimize (${{ env.BUILD_DATE }})
-          body_path: release_body.md
+          tag_name: ImmortalWrt-25.12.1-${{ github.run_id }}
+          name: ImmortalWrt 25.12.1 ARMSR RootFS
+          body: |
+            ## ImmortalWrt 25.12.1 (ARMSR / armv8) 自动构建
+            - **架构 / 包管理器**: ARMSR (ARM64) / APK
+            - **内置组件**: 
+              - PassWall 2 (`luci-app-passwall2`)
+              - Nikki (Mihomo 核心)
+              - MosDNS & AdGuard Home (`adguardhome` + 命令行二进制)
+              - HTTPS / ACME 自动化证书工具链
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
