@@ -3,7 +3,7 @@ name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
 on:
   workflow_dispatch:
   schedule:
-    # 国际标准时间 (UTC) 每偶数月 1 日 0:00 触发 (北京时间 08:00)
+    # 每偶数月 1 日 0:00 UTC 自动构建
     - cron: '0 0 1 */2 *'
 
 jobs:
@@ -14,18 +14,18 @@ jobs:
       contents: write
 
     steps:
-      # 1. 拉取仓库代码
+      # 1. 检出代码
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链与依赖
+      # 2. 准备构建环境
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
 
-      # 3. 提取 ImageBuilder
+      # 3. 下载并解压 ImageBuilder
       - name: Download & Extract ImageBuilder
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
@@ -51,24 +51,34 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (严格限定 PassWall 2)
-      - name: Download & Integrate Offline Packages
+      # 4. 配置第三方 PassWall 2 专属 APK 源与离线包集成
+      - name: Configure PassWall2 Repo & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
-          cd builder/packages
+          cd builder
 
-          # 通用离线包下载函数
+          # A. 配置 ImageBuilder 自定义 APK 软件源
+          echo "==> 添加 PassWall 2 认证 APK 软件源..."
+          mkdir -p keys
+          wget -q -O keys/passwall.pub https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub || true
+
+          # 写入 repositories.conf 文件供 APK 读取
+          cat <<EOF >> repositories.conf
+          https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall2
+          https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall_packages
+          EOF
+
+          cd packages
+
+          # 通用离线下载函数
           download_assets() {
             local repo=$1
             local pattern=$2
-            echo "==> 正在获取 $repo 的最新 Release 资产 (匹配模式: ${pattern:-全部})..."
+            echo "==> 正在获取 $repo 的最新 Release 资产..."
             local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
             local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
             
-            if [ -z "$urls" ]; then
-              echo "警告: 未在 $repo 找到有效下载 URL"
-              return 1
-            fi
+            [ -z "$urls" ] && return 1
 
             for url in $urls; do
               if [ -n "$pattern" ]; then
@@ -85,21 +95,17 @@ jobs:
             done
           }
 
-          # 1) Nikki
+          # B. 抓取 Nikki, MosDNS, AdGuardHome 等常用离线 APK
           download_assets "nikkinikki-org/OpenWrt-nikki"
-
-          # 2) MosDNS
           download_assets "sbwml/luci-app-mosdns"
-
-          # 3) PassWall 2 专用匹配 (严格限制只能下载包含 passwall2 命名的 apk/zip)
-          echo "==> 检索 PassWall 2 专属离线包..."
-          download_assets "chingu910/openwrt-passwall2" "passwall2" || \
-          download_assets "xiaorouji/openwrt-passwall2" "passwall2" || true
-
-          # 4) AdGuardHome (LuCI App)
           download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
 
-          # 解压可能下载到的 zip / tar.gz 归档包
+          # C. 针对 PassWall 2 执行精准离线兜底下载
+          echo "==> 获取 PassWall 2 离线安装包..."
+          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || \
+          download_assets "chingu910/openwrt-passwall2" "passwall2" || true
+
+          # 解压可能包含的压缩包
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -110,25 +116,19 @@ jobs:
             rm -f "$archive"
           done
 
-          # 将解压后处在子目录中的所有 .apk 文件提升到 packages 根目录
+          # 将解压后的子目录 apk 提升到根路径
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
-          # 强制清理误刷入的 PassWall 1 代包 (如有)
+          # 关键处理：删除混入的全部第一代 PassWall (.apk)
           rm -f *passwall_*.apk 2>/dev/null || true
+          rm -f luci-app-passwall_*.apk 2>/dev/null || true
 
-          # 打印当前成功抓取到的 APK 列表
           echo "=========================================="
-          echo "当前成功集成至 ImageBuilder 本地库的离线 APK 清单："
-          ls -la *.apk || echo "::warning::未找到任何 APK 文件！"
+          echo "准备就绪的本地 APK 依赖列表："
+          ls -la *.apk || echo "未提取到本地离线 APK，将完全依赖在线源编译。"
           echo "=========================================="
 
-          # 校验 PassWall 2 是否成功落盘
-          if ! ls luci-app-passwall2*.apk >/dev/null 2>&1 && ! ls *passwall2*.apk >/dev/null 2>&1; then
-            echo "::error::未检测到 PassWall 2 (luci-app-passwall2) 的 APK 文件！请检查源中是否有对应 25.12 APK 格式产物。"
-            exit 1
-          fi
-
-      # 5. 生成自定义系统配置
+      # 5. 注入初始化配置
       - name: Inject Custom Configuration
         run: |
           FILES_DIR="builder/files/etc/uci-defaults"
@@ -155,7 +155,7 @@ jobs:
 
           chmod +x "$FILES_DIR/99-custom-init.sh"
 
-      # 6. 提取主要组件与内核版本号
+      # 6. 收集编译信息
       - name: Collect Software Versions
         run: |
           KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
@@ -167,7 +167,7 @@ jobs:
             if [ -n "$file" ]; then
               echo "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$|\.apk$//'
             else
-              echo "未知"
+              echo "源/自动拉取"
             fi
           }
 
@@ -181,7 +181,7 @@ jobs:
           echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
 
           cat <<EOF > $GITHUB_WORKSPACE/release_body.md
-          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版构建
+          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版 RootFS
 
           - **构建日期**: $BUILD_DATE
           - **构建 ID**: ${{ github.run_id }}
@@ -201,18 +201,19 @@ jobs:
           - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-nft-socket、kmod-nft-nat、kmod-tun、curl、wget-ssl、yq
           EOF
 
-      # 7. 打包 RootFS
+      # 7. 构建 RootFS 镜像
       - name: Build RootFS
         run: |
           cd builder
 
+          # 在 PACKAGES 中明确只指定 PassWall 2，拒绝混入一代
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             nikki luci-app-nikki luci-i18n-nikki-zh-cn \
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-            luci-app-passwall2 \
+            luci-app-passwall2 luci-i18n-passwall2-zh-cn \
             adguardhome luci-app-adguardhome \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
@@ -221,7 +222,7 @@ jobs:
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 编译产物到 Artifacts
+      # 8. 上传 Artifacts 产物
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -230,7 +231,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 9. 发布编译产物到 GitHub Releases
+      # 9. 发布 GitHub Release
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
