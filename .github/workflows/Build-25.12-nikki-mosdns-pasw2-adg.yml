@@ -1,48 +1,40 @@
-name: Build ImmortalWrt 25.12.1 for OECT (OneCloud)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite + HTTPS)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build OECT Custom Firmware
+    name: Build ImmortalWrt RootFS
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      # 1. Checkout repository code
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Prepare build toolchain (Fixed i386 architecture support)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-          sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd \
-            gawk qemu-utils dosfstools mtools jq unzip openssl libc6:i386 libstdc++6:i386
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip openssl abuild
 
-      # 3. Direct extraction of ImageBuilder (OECT Target: meson/s80x)
-      - name: Download & Extract ImageBuilder for OECT
+      - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
-          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/meson/s80x/"
-          echo "Connecting to OECT target repository: ${TARGET_DIR}"
-
+          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
-
+          
           if [ -z "$IB_FILE" ]; then
-            echo "::error::Failed to locate ImageBuilder package in meson/s80x!"
+            echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder！"
             exit 1
           fi
-
+          
           DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
-          echo "Downloading OECT ImageBuilder from: ${DOWNLOAD_URL}"
-
+          echo "Downloading: ${DOWNLOAD_URL}"
           curl -sL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
-
+          
           if [[ "$IB_FILE" == *.zst ]]; then
             tar --zstd -xf ib_package.archive -C builder --strip-components=1
           else
@@ -50,166 +42,145 @@ jobs:
           fi
           rm -f ib_package.archive
 
-          cd builder
-          echo "--- repositories.conf ---"
-          cat repositories.conf || true
-
-      # 4. Download offline packages + Build local repository
       - name: Download & Integrate Offline Packages
         run: |
-          set -e
           mkdir -p builder/packages
-          mkdir -p builder/files/etc/apk/keys
+          cd builder/packages
 
-          cd builder
-
-          # Asset retrieval function
+          # 下载函数：严格过滤 aarch64/noarch/all 架构
           download_assets() {
-            local repo="$1"
-            local pattern="${2:-}"
-            echo "==> Fetching assets for $repo..."
-            local api="https://api.github.com/repos/$repo/releases"
-            local rel_json
-            rel_json=$(curl -sL "$api/latest")
+            local repo=$1
+            local pattern=$2
+            echo "==> Fetching assets from $repo..."
+            local urls=$(curl -sL "https://api.github.com/repos/$repo/releases/latest" | jq -r '.assets[].browser_download_url // empty')
+            [ -z "$urls" ] && return 0
             
-            if [ -z "$rel_json" ] || echo "$rel_json" | grep -q "404"; then
-              rel_json=$(curl -sL "$api" | jq '[.[] | select(.prerelease==false)][0] // .[0]')
-            fi
-            
-            local urls
-            urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
-
-            [ -z "$urls" ] && { echo "    ⚠️  No assets found"; return 0; }
-
-            echo "$urls" | while read -r url; do
-              [ -z "$url" ] && continue
-              local name; name=$(basename "$url")
-              if echo "$name" | grep -E -q -i '\.(apk|ipk|zip|tar\.gz|tgz)$'; then
-                if [ -n "$pattern" ]; then
-                  if echo "$name" | grep -E -q -i "$pattern"; then
-                    echo "    Downloading (matched): $name"
-                    curl -sSL -O "$url" || true
-                  fi
-                else
-                  echo "    Downloading (all): $name"
-                  curl -sSL -O "$url" || true
-                fi
-              fi
+            for url in $urls; do
+              if [[ "$url" != *.apk ]]; then continue; fi
+              if [ -n "$pattern" ] && ! echo "$url" | grep -qiE "$pattern"; then continue; fi
+              
+              echo "Downloading: $url"
+              curl -sSL -O "$url" || true
             done
           }
 
-          cd packages
+          # 拉取第三方插件
+          download_assets "nikkinikki-org/OpenWrt-nikki" "aarch64|noarch|all"
+          download_assets "sbwml/luci-app-mosdns" "aarch64|noarch|all"
+          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2.*(aarch64|noarch|all)"
+          download_assets "asv1st/luci-app-adguardhome" "aarch64|noarch|all"
 
-          # Download target packages
-          download_assets "nikkinikki-org/OpenWrt-Nikki" "nikki"
-          download_assets "sbwml/luci-app-mosdns" "mosdns|luci"
-          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || true
-          download_assets "asv1st/luci-app-adguardhome" "adguardhome|luci" || true
-
-          # Extract packed archives
-          for archive in *.zip *.tar.gz *.tgz; do
-            [ -e "$archive" ] || continue
-            if [[ "$archive" == *.zip ]]; then
-              unzip -o "$archive" || true
+          # 清理非目标架构包
+          echo "==> Filtering non-ARM64 packages..."
+          for apk_file in *.apk; do
+            [ -f "$apk_file" ] || continue
+            ARCH=$(tar -xzOf "$apk_file" .PKGINFO 2>/dev/null | grep '^arch =' | awk '{print $3}')
+            if [[ "$ARCH" != "aarch64" && "$ARCH" != "noarch" && "$ARCH" != "all" ]]; then
+              echo "❌ Removing incompatible arch ($ARCH): $apk_file"
+              rm -f "$apk_file"
             else
-              tar -xzf "$archive" || true
+              echo "✅ Keeping ($ARCH): $apk_file"
             fi
-            rm -f "$archive"
           done
+          
+          ls -la *.apk || echo "No local APKs found."
 
-          # Flatten directory structure
-          find . -mindepth 2 -type f \( -name "*.apk" -o -name "*.ipk" \) -exec mv -n {} . \; 2>/dev/null || true
-
-          # Filter out non-arm/non-armv7 architectures for OECT
-          for pkg_file in *.apk *.ipk; do
-            [ -f "$pkg_file" ] || continue
-            case "$pkg_file" in
-              *_x86_64_*|*_i386_*|*_aarch64_*|*_mips_*)
-                echo "    ❌ Removing non-ARM32 package: $pkg_file"
-                rm -f "$pkg_file" ;;
-            esac
-          done
-
-          cd ..
-
-          # Configure repositories.conf with local repository
-          LOCAL_REPO_URL="--allow-untrusted file://${PWD}/packages"
-          echo "$LOCAL_REPO_URL" >> repositories.conf
-
-          # Generate signing keys
-          openssl genrsa -out keys/local_key.rsa.pem 2048 2>/dev/null
-          openssl rsa -in keys/local_key.rsa.pem -pubout -out keys/local_key.rsa.pub 2>/dev/null
-          cp keys/local_key.rsa.pub files/etc/apk/keys/local_key.rsa.pub
-
-          # Build index
-          make package_index || true
-
-          if [ -f "packages/APKINDEX.tar.gz" ]; then
-            openssl dgst -sha256 -sign keys/local_key.rsa.pem \
-              -out packages/APKINDEX.tar.gz.sig packages/APKINDEX.tar.gz 2>/dev/null || true
-            cp keys/local_key.rsa.pub packages/local_key.rsa.pub
-          fi
-
-          printf '# Allow untrusted packages\nallow_untrusted = true\n' > files/etc/apk/apk.conf
-
-      # 5. Build Image for OECT (Profile: xunlei_onecloud)
-      - name: Build OECT Image
+      - name: Sign Local APK Repository
         run: |
           cd builder
+          
+          # 提取 IB 内置构建密钥
+          KEY_BUILD=$(find . -maxdepth 2 -name "key-build" -type f | head -n 1)
+          KEY_BUILD_PUB=$(find . -maxdepth 2 -name "key-build.pub" -type f | head -n 1)
+          
+          if [ -z "$KEY_BUILD" ] || [ -z "$KEY_BUILD_PUB" ]; then
+            echo "::error::Cannot find key-build or key-build.pub in ImageBuilder!"
+            exit 1
+          fi
+          
+          echo "Using build key: $KEY_BUILD"
+          
+          # 将公钥注入最终 rootfs 的信任池
+          mkdir -p files/etc/apk/keys/
+          cp "$KEY_BUILD_PUB" files/etc/apk/keys/
+          
+          # 使用 abuild-sign 对所有本地第三方 APK 进行内嵌重签名
+          if ls packages/*.apk 1> /dev/null 2>&1; then
+            echo "==> Re-signing local APKs with build key..."
+            abuild-sign -k "$KEY_BUILD" packages/*.apk
+          fi
+          
+          # 重新生成 packages.adb（自动使用同一把私钥内嵌签名）
+          echo "==> Generating signed packages.adb..."
+          make package_index
 
-          export APK="apk --allow-untrusted"
-          export APK_ARGS="--allow-untrusted"
-          export EXTRA_APK_ARGS="--allow-untrusted"
+      - name: Integrate AdGuard Home Binary
+        run: |
+          mkdir -p builder/files/opt
+          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
+          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
+          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
 
-          # Tailored package list for OECT hardware resources
+      - name: Configure AdGuard Home Service
+        run: |
+          mkdir -p builder/files/etc/init.d
+          cat << 'EOF' > builder/files/etc/init.d/adguardhome
+          #!/bin/sh /etc/rc.common
+          START=99
+          STOP=10
+          USE_PROCD=1
+          PROG=/opt/AdGuardHome/AdGuardHome
+          WORK_DIR=/opt/AdGuardHome
+          start_service() {
+              procd_open_instance
+              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
+              procd_set_param respawn
+              procd_close_instance
+          }
+          EOF
+          chmod +x builder/files/etc/init.d/adguardhome
+
+      - name: Build RootFS
+        run: |
+          cd builder
+          
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
-            luci \
-            luci-i18n-base-zh-cn \
-            luci-theme-argon \
+            luci luci-i18n-base-zh-cn luci-theme-argon \
             vsftpd openssh-sftp-server \
             nikki luci-app-nikki luci-i18n-nikki-zh-cn \
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
             luci-app-passwall2 luci-i18n-passwall2-zh-cn \
             adguardhome luci-app-adguardhome \
-            luci-app-acme luci-i18n-acme-zh-cn openssl-util \
+            luci-app-acme luci-i18n-acme-zh-cn openssl-util px5g-standalone \
+            luci-i18n-smartdns-zh-cn luci-app-vlmcsd luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
-            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun"
+            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          # Detect profile name (xunlei_onecloud or onecloud)
-          PROFILE_NAME=$(make info | grep -oE 'xunlei_onecloud|onecloud' | head -n 1)
-          if [ -z "$PROFILE_NAME" ]; then
-            PROFILE_NAME="xunlei_onecloud"
-          fi
-          echo "Selected Profile: $PROFILE_NAME"
-
-          make image PROFILE="$PROFILE_NAME" \
+          # ADD_LOCAL_KEY=1 确保编译期信任本地重签名的包
+          make image PROFILE="generic" \
             PACKAGES="$PACKAGES" \
             FILES="files" \
-            APK_ARGS="--allow-untrusted" \
-            EXTRA_APK_ARGS="--allow-untrusted" \
+            ADD_LOCAL_KEY=1 \
             -j$(nproc)
 
-      # 6. Upload OECT Firmware Artifacts
-      - name: Upload OECT Artifacts
+      - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-oect-onecloud
-          path: builder/bin/targets/meson/s80x/*
+          name: immortalwrt-25.12.1-armsr-rootfs
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 7. Release to GitHub
-      - name: Upload to GitHub Release
+      - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: OECT-ImmortalWrt-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 for OECT (OneCloud)
+          tag_name: ImmortalWrt-25.12.1-${{ github.run_id }}
+          name: ImmortalWrt 25.12.1 ARMSR RootFS
           body: |
-            ## OECT (玩客云 OneCloud) 专用固件构建
-            - **Target**: `meson/s80x`
-            - **Profile**: `xunlei_onecloud`
-            - **特性**: 专为玩客云硬件适配，已集成基本代理及 DNS 优化套件。
-          files: builder/bin/targets/meson/s80x/*
+            ## ImmortalWrt 25.12.1 (ARMSR / armv8) Auto Build
+            - **Arch / Pkg Manager**: ARMSR (ARM64) / APK
+            - **Built-in Components**: PassWall2, Nikki, MosDNS, AdGuardHome, ACME
+          files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
