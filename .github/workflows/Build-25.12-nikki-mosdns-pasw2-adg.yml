@@ -18,12 +18,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备构建环境
+      # 2. 准备构建环境 (安装 apk-tools 以便本地建立 APK 索引)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip apk-tools
 
       # 3. 下载并解压 ImageBuilder
       - name: Download & Extract ImageBuilder
@@ -51,14 +51,14 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 配置第三方 APK 源与精准 ARM64 离线包下载
-      - name: Configure Repositories & Integrated ARM64 Packages
+      # 4. 配置软件源、提取离线包并生成本地 APK 索引库
+      - name: Configure Repositories & Build APK Index
         run: |
           mkdir -p builder/packages
           cd builder
 
-          # A. 配置 PassWall 2 / Nikki / MosDNS 专属 ARM64 软件源 (解决 mihomo、geo2txt 依赖)
-          echo "==> 添加第三方套件认证 APK 软件源..."
+          # A. 配置 PassWall 2 专属软件源
+          echo "==> 添加 PassWall 2 认证 APK 软件源..."
           mkdir -p keys
           wget -q -O keys/passwall.pub https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub || true
 
@@ -69,46 +69,43 @@ jobs:
 
           cd packages
 
-          # 精准抓取 ARM64 架构离线包函数 (排除 x86_64/x86/x64/amd64)
-          download_arm64_assets() {
+          # B. 离线资产获取函数 (智能放宽匹配，排除 x86)
+          download_assets() {
             local repo=$1
             local pattern=$2
-            echo "==> 检索 $repo 的 ARM64 / ARCH-ALL 离线包..."
+            echo "==> 抓取 $repo Release 资产..."
             local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
             local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
 
-            [ -z "$urls" ] && return 1
+            [ -z "$urls" ] && return 0
 
             for url in $urls; do
-              # 排除一切 x86 / amd64 相关的包，仅匹配 aarch64 或 all 架构
+              # 剔除明确为 x86/amd64/i386 的文件
               if echo "$url" | grep -E -i '(x86|amd64|i386)'; then
                 continue
               fi
 
               if [ -n "$pattern" ]; then
                 if echo "$url" | grep -E -i "$pattern"; then
-                  echo "下载匹配包: $url"
+                  echo "下载包: $url"
                   curl -sSL -O "$url" || true
                 fi
               else
-                if echo "$url" | grep -E -i '(aarch64|armv8|all)\.(apk|zip|tar\.gz)$'; then
-                  echo "下载匹配包: $url"
+                if echo "$url" | grep -E -i '\.(apk|zip|tar\.gz)$'; then
+                  echo "下载包: $url"
                   curl -sSL -O "$url" || true
                 fi
               fi
             done
           }
 
-          # B. 精准拉取 ARM64 / All 架构的组件
-          download_arm64_assets "nikkinikki-org/OpenWrt-nikki"
-          download_arm64_assets "sbwml/luci-app-mosdns"
-          download_arm64_assets "asv1st/luci-app-adguardhome" || download_arm64_assets "lsong2020/luci-app-adguardhome" || true
+          # 执行抓取
+          download_assets "nikkinikki-org/OpenWrt-nikki"
+          download_assets "sbwml/luci-app-mosdns"
+          download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
+          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || download_assets "chingu910/openwrt-passwall2" "passwall2" || true
 
-          # C. 精准拉取 PassWall 2 的 ARM64 包
-          download_arm64_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || \
-          download_arm64_assets "chingu910/openwrt-passwall2" "passwall2" || true
-
-          # 解压压缩包
+          # C. 解压所有归档文件
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -119,19 +116,30 @@ jobs:
             rm -f "$archive"
           done
 
-          # 整理包路径
+          # 提取所有深层目录的 .apk 文件到 packages 根路径
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
-          # 二次安全清理：清除所有非 aarch64/all 架构包以及 PassWall 1 代包
-          rm -f *x86*.apk *amd64*.apk 2>/dev/null || true
+          # 物理隔离 PassWall 1 代包
           rm -f *passwall_*.apk 2>/dev/null || true
 
           echo "=========================================="
-          echo "通过架构校验的 ARM64 离线 APK 列表："
-          ls -la *.apk || echo "注意: 未搜寻到适合 ARM64 的本地包，依赖项将通过配置的在线源直接拉取。"
+          echo "当前成功提取的本地 APK 列表："
+          ls -la *.apk || echo "未抓取到本地 APK"
           echo "=========================================="
 
-      # 5. 注入初始化配置
+          # D. 核心关键步骤：强制为本地 packages 目录生成 packages.adb 索引库
+          echo "==> 正在为本地 packages 生成 APK 包索引 (packages.adb)..."
+          if command -v apk >/dev/null 2>&1; then
+            apk index -o packages.adb *.apk 2>/dev/null || true
+          fi
+
+          # 如果系统缺少 apk 工具，使用 ImageBuilder 内置命令兜底建立索引
+          if [ ! -f packages.adb ]; then
+            cd ..
+            make package_index 2>/dev/null || true
+          fi
+
+      # 5. 注入初始化配置 (系统时区与 KMS 启动)
       - name: Inject Custom Configuration
         run: |
           FILES_DIR="builder/files/etc/uci-defaults"
@@ -158,7 +166,7 @@ jobs:
 
           chmod +x "$FILES_DIR/99-custom-init.sh"
 
-      # 6. 收集软件版本信息
+      # 6. 收集编译软硬件版本
       - name: Collect Software Versions
         run: |
           KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
@@ -209,7 +217,6 @@ jobs:
         run: |
           cd builder
 
-          # 只保留 luci-app-passwall2，由 apk 软件源自动解析核心依赖包
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
@@ -225,7 +232,7 @@ jobs:
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 Artifacts 产物
+      # 8. 上传 RootFS 构建产物
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
