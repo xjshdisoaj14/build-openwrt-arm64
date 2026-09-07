@@ -18,7 +18,8 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip openssl abuild
+          # 移除不存在的 abuild，保留必要的编译与解压工具
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip openssl
 
       - name: Download & Extract ImageBuilder (25.12.1 Direct)
         run: |
@@ -47,7 +48,6 @@ jobs:
           mkdir -p builder/packages
           cd builder/packages
 
-          # 下载函数：严格过滤 aarch64/noarch/all 架构
           download_assets() {
             local repo=$1
             local pattern=$2
@@ -64,13 +64,11 @@ jobs:
             done
           }
 
-          # 拉取第三方插件
           download_assets "nikkinikki-org/OpenWrt-nikki" "aarch64|noarch|all"
           download_assets "sbwml/luci-app-mosdns" "aarch64|noarch|all"
           download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2.*(aarch64|noarch|all)"
           download_assets "asv1st/luci-app-adguardhome" "aarch64|noarch|all"
 
-          # 清理非目标架构包
           echo "==> Filtering non-ARM64 packages..."
           for apk_file in *.apk; do
             [ -f "$apk_file" ] || continue
@@ -85,7 +83,7 @@ jobs:
           
           ls -la *.apk || echo "No local APKs found."
 
-      - name: Sign Local APK Repository
+      - name: Sign Local APK Repository & Generate Index
         run: |
           cd builder
           
@@ -104,14 +102,10 @@ jobs:
           mkdir -p files/etc/apk/keys/
           cp "$KEY_BUILD_PUB" files/etc/apk/keys/
           
-          # 使用 abuild-sign 对所有本地第三方 APK 进行内嵌重签名
-          if ls packages/*.apk 1> /dev/null 2>&1; then
-            echo "==> Re-signing local APKs with build key..."
-            abuild-sign -k "$KEY_BUILD" packages/*.apk
-          fi
-          
-          # 重新生成 packages.adb（自动使用同一把私钥内嵌签名）
-          echo "==> Generating signed packages.adb..."
+          # 【核心修复】直接使用 IB 自带的 make package_index
+          # ImmortalWrt IB 的 Makefile 内部已封装好 apk 签名逻辑
+          # 它会自动使用 key-build 对 packages/ 下的 apk 重签并生成合法的 packages.adb
+          echo "==> Generating signed packages.adb via ImageBuilder internals..."
           make package_index
 
       - name: Integrate AdGuard Home Binary
