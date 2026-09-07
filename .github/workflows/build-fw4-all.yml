@@ -15,20 +15,20 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链并独立安装 apk 静态二进制
+      # 2. 准备编译工具链并安装 Alpine apk 静态二进制
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
 
-          # 直接下载 Alpine 官方 apk.static 工具，避免 Ubuntu apt 找不到 apk-tools
+          # 安装 Alpine apk.static，解决 Ubuntu 无 apt-tools 问题
           mkdir -p /tmp/apk-setup
-          curl -sSL "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/apk-tools-static-3.20.0-r0.apk" | tar -xz -C /tmp/apk-setup
+          curl -fsSL "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/apk-tools-static-3.20.0-r0.apk" | tar -xz -C /tmp/apk-setup
           sudo cp /tmp/apk-setup/sbin/apk.static /usr/local/bin/apk
           sudo chmod +x /usr/local/bin/apk
           rm -rf /tmp/apk-setup
-          echo "APK Tool 版本信息:"
+          echo "APK Tool 版本:"
           apk --version
 
       # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
@@ -37,7 +37,7 @@ jobs:
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
 
-          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+          IB_FILE=$(curl -fsSL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
             echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
@@ -47,7 +47,7 @@ jobs:
           DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
           echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
 
-          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
+          curl -fsSL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
 
           if [[ "$IB_FILE" == *.zst ]]; then
@@ -65,23 +65,24 @@ jobs:
           mkdir -p builder/packages
           cd builder/packages
 
-          # 通用带 Token 鉴权的 GitHub Release 资源下载函数
+          # 带 Token 鉴权的安全下载函数
           download_latest_assets() {
             local repo=$1
             echo "==> 正在获取 $repo 的最新 Releases..."
             local rel_json
-            rel_json=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/releases/latest")
-            local urls
-            urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
+            rel_json=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/releases/latest" || true)
             
-            if [ -z "$urls" ]; then
-              echo "::warning::未在 $repo 中找到对应的安装包资源。"
+            if [ -z "$rel_json" ]; then
+              echo "::warning::未能成功读取仓库 $repo 的 Release 信息。"
               return 0
             fi
 
+            local urls
+            urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
+            
             for url in $urls; do
               echo "正在下载: $url"
-              curl -sSL -O "$url"
+              curl -fsSL -O "$url" || true
             done
           }
 
@@ -91,12 +92,12 @@ jobs:
           # 2) MosDNS
           download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 3) PassWall 2 (拉取 PassWall 2 专用仓库)
-          download_latest_assets "Openwrt-Passwall/openwrt-passwall2" || true
+          # 3) PassWall 2 专用仓库
+          download_latest_assets "openwrt-passwall/openwrt-passwall2" || true
           download_latest_assets "xiaorouji/openwrt-passwall2" || true
-          download_latest_assets "Openwrt-Passwall/openwrt-passwall-packages" || true
+          download_latest_assets "openwrt-passwall/openwrt-passwall-packages" || true
 
-          # 解压压缩包提取内部 apk / ipk
+          # 解压可能包含离线包的 zip/tar.gz
           for archive in *.tar.gz *.zip; do
             if [ -f "$archive" ]; then
               tar -zxvf "$archive" 2>/dev/null || unzip -o "$archive" 2>/dev/null || true
@@ -104,25 +105,40 @@ jobs:
             fi
           done
 
-          # 归集所有 .apk / .ipk 文件到 builder/packages 根目录
+          # 统一归集所有 .apk / .ipk 文件到 builder/packages 根目录
           find . -mindepth 2 \( -name "*.apk" -o -name "*.ipk" \) -exec mv {} . \;
 
-          # 为本地离线包生成 APK 数据库索引 (packages.adb)
+          # 生成本地 APK 索引库 (packages.adb)
           if ls *.apk >/dev/null 2>&1; then
             echo "==> 正在建立本地 APK 索引库..."
             apk index -o packages.adb *.apk 2>/dev/null || true
           fi
 
-          echo "当前已集成的离线 APK 清单："
+          echo "当前已集成的离线包清单："
           ls -la *.apk 2>/dev/null || true
 
-      # 5. 集成 AdGuard Home 二进制 (ARM64)
+      # 5. 集成 AdGuard Home 二进制 (ARM64) - 增加校验与落地保护
       - name: Integrate AdGuard Home Binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p builder/files/opt
-          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
-          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
+          mkdir -p builder/files/opt/AdGuardHome
+          
+          AGH_JSON=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest" || true)
+          AGH_URL=$(echo "$AGH_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E 'AdGuardHome_linux_arm64\.tar\.gz' | head -n 1)
+
+          if [ -z "$AGH_URL" ]; then
+            echo "::warning::自动获取最新链接失败，使用备用稳定版 AdGuard Home 链接..."
+            AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.56/AdGuardHome_linux_arm64.tar.gz"
+          fi
+
+          echo "正在从以下地址下载 AdGuard Home: $AGH_URL"
+          curl -fsSL "$AGH_URL" -o /tmp/agh.tar.gz
+          
+          tar -zxvf /tmp/agh.tar.gz -C /tmp/
+          cp -r /tmp/AdGuardHome/* builder/files/opt/AdGuardHome/
           chmod +x builder/files/opt/AdGuardHome/AdGuardHome
+          rm -rf /tmp/agh.tar.gz /tmp/AdGuardHome
 
       # 6. 配置 AdGuard Home 服务自启动
       - name: Configure AdGuard Home Service
@@ -156,7 +172,7 @@ jobs:
         run: |
           cd builder
 
-          # 读取本地离线包中的真实 APK 包名，防止包名书写不一致导致 Error
+          # 自动读取本地离线包包名
           LOCAL_PKGS=""
           if ls packages/*.apk >/dev/null 2>&1; then
             for f in packages/*.apk; do
@@ -167,12 +183,8 @@ jobs:
             done
           fi
 
-          echo "已自动读取并解析本地离线包: $LOCAL_PKGS"
+          echo "自动解析到的本地包名: $LOCAL_PKGS"
 
-          # 预装包配置：
-          # 1. Web 服务器 HTTP/HTTPS 控制开关组件：luci-app-uhttpd + luci-i18n-uhttpd-zh-cn
-          # 2. 移除 daed 和 luci-i18n-acme-zh-cn
-          # 3. 预装 PassWall 2 核心及依赖（xray-core / sing-box / chinadns-ng 等）
           BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -212,7 +224,7 @@ jobs:
             ## ImmortalWrt 25.12.1 (ARMSR / armv8) 自动构建
             - **架构 / 包管理器**: ARMSR (ARM64) / APK
             - **内置组件**: 
-              - PassWall 2
+              - PassWall 2 (支持 Xray / Sing-box)
               - Nikki (Mihomo 核心)
               - MosDNS & AdGuard Home
               - Web HTTP/HTTPS 控制面板 (uHTTPd 管理界面)
