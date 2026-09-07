@@ -18,7 +18,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链与依赖 (已移除不存在的 apk-tools)
+      # 2. 准备编译工具链与依赖
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
@@ -51,7 +51,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall + AdGuardHome)
+      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall 2 + AdGuardHome)
       - name: Download & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
@@ -75,8 +75,8 @@ jobs:
           # 2) MosDNS
           download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 3) PassWall (拉取支持 APK 架构编译产物的源)
-          download_latest_assets "chingu910/openwrt-passwall" || download_latest_assets "xiaorouji/openwrt-passwall"
+          # 3) PassWall 2
+          download_latest_assets "Alist-OpenWrt/openwrt-passwall2" || download_latest_assets "chingu910/openwrt-passwall2"
 
           # 4) AdGuardHome (LuCI App)
           download_latest_assets "asv1st/luci-app-adguardhome"
@@ -100,35 +100,32 @@ jobs:
           ls -la *.apk || echo "未找到 APK 文件！"
           echo "=========================================="
 
-      # 5. 生成自定义系统配置 (修复 uci: command not found 问题的关键)
+      # 5. 生成自定义系统配置 (修复 uci: command not found 报错)
       - name: Inject Custom Configuration
         run: |
           # 创建 OpenWrt 文件系统预置目录
           FILES_DIR="builder/files/etc/uci-defaults"
           mkdir -p "$FILES_DIR"
 
-          # 注入首次开机初始化脚本 (运行在真正的 OpenWrt 内部，确保 uci 命令可用)
+          # 注入首次开机初始化脚本 (注意：使用 'EOF' 单引号防止宿主机展开)
           cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
           #!/bin/sh
 
+          # 显式导入完整的系统 PATH，防止 uci-defaults 执行阶段找不到 /sbin/uci
+          export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
           # 1. 配置语言与时区
-          uci set system.@system[0].timezone='CST-8'
-          uci set system.@system[0].zonename='Asia/Shanghai'
-          uci commit system
+          if command -v uci >/dev/null 2>&1; then
+            uci set system.@system[0].timezone='CST-8'
+            uci set system.@system[0].zonename='Asia/Shanghai'
+            uci commit system
 
-          # 2. 启用 vlmcsd (KMS 服务)
-          if [ -f /etc/config/vlmcsd ]; then
-            uci set vlmcsd.config.enabled='1'
-            uci commit vlmcsd
+            # 2. 启用 vlmcsd (KMS 服务)
+            if [ -f /etc/config/vlmcsd ]; then
+              uci set vlmcsd.config.enabled='1'
+              uci commit vlmcsd
+            fi
           fi
-
-          # 3. 启用服务自启（软链接方式兜底）
-          [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
-          [ -f /etc/init.d/nikki ] && /etc/init.d/nikki enable
-          [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns enable
-          [ -f /etc/init.d/passwall ] && /etc/init.d/passwall enable
-          [ -f /etc/init.d/passwall2 ] && /etc/init.d/passwall2 enable
-          [ -f /etc/init.d/adguardhome ] && /etc/init.d/adguardhome enable
 
           exit 0
           EOF
@@ -156,7 +153,7 @@ jobs:
           NIKKI_VER=$(GET_VER "nikki")
           LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
           MOSDNS_VER=$(GET_VER "mosdns")
-          PASSWALL_VER=$(GET_VER "luci-app-passwall")
+          PASSWALL2_VER=$(GET_VER "luci-app-passwall2")
           ADG_VER=$(GET_VER "luci-app-adguardhome")
 
           # 3. 获取北京时间 (UTC+8)
@@ -178,13 +175,13 @@ jobs:
           - **Nikki Core**: \`$NIKKI_VER\`
           - **LuCI App Nikki**: \`$LUCI_NIKKI_VER\`
           - **MosDNS**: \`$MOSDNS_VER\`
-          - **PassWall**: \`$PASSWALL_VER\`
+          - **PassWall 2**: \`$PASSWALL2_VER\`
           - **AdGuard Home**: \`$ADG_VER\`
 
           ### 🛠 集成软件列表
-          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall、AdGuard Home
+          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall 2、AdGuard Home
           - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
-          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-nft-socket、kmod-tun、curl、wget-ssl、yq
+          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-nft-socket、kmod-nft-nat、kmod-tun、curl、wget-ssl、yq
           EOF
 
       # 7. 打包 RootFS
@@ -192,14 +189,14 @@ jobs:
         run: |
           cd builder
 
-          # 包含预置 custom files
+          # 打包软件列表
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             nikki luci-app-nikki luci-i18n-nikki-zh-cn \
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-            luci-app-passwall \
+            luci-app-passwall2 \
             adguardhome luci-app-adguardhome \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
