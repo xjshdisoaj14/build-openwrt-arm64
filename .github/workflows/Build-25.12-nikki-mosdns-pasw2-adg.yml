@@ -20,8 +20,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd \
-            gawk qemu-utils dosfstools mtools jq unzip openssl libc6:i386 libstdc++6:i386
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip openssl
 
       # 3. 直连提取 ImageBuilder (25.12.1 / armsr/armv8)
       - name: Download & Extract ImageBuilder (25.12.1 Direct)
@@ -49,167 +48,180 @@ jobs:
           fi
           rm -f ib_package.archive
 
-          cd builder
-          echo "--- repositories.conf (原始) ---"
-          cat repositories.conf || true
-
-      # 4. 下载离线包 + 生成可被 apk 信任的本地仓库
+      # 4. 精准获取离线包 + 追加 PassWall 在线源 (APK)
       - name: Download & Integrate Offline Packages
         run: |
-          set -e
           mkdir -p builder/packages
-          mkdir -p builder/files/etc/apk/keys
-
           cd builder
 
-          # A. 下载 PassWall 2 官方源公钥（兜底）
-          mkdir -p keys
-          wget -q -O keys/passwall.pub \
-            https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub || true
+          # A. 追加 PassWall 2 官方在线源 (改用无反人机校验的镜像, SourceForge 会被 Cloudflare 拦截)
+          cat <<'EOF' >> repositories.conf
+          https://mirrors.vsean.net/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/passwall2
+          https://mirrors.vsean.net/openwrt/releases/25.12.1/packages/aarch64_cortex-a53/passwall_packages
+          EOF
 
-          # B. 资产获取通用函数
+          cd packages
+
+          # B. 离线资产获取函数 (仅下载 .apk / .zip / .tar.gz)
           download_assets() {
-            local repo="$1"
-            local pattern="${2:-}"
+            local repo=$1
+            local pattern=$2
             echo "==> 正在获取 $repo 的 Release 资产..."
-            local api="https://api.github.com/repos/$repo/releases"
-            local rel_json
-            rel_json=$(curl -sL "$api/latest")
-            
-            if [ -z "$rel_json" ] || echo "$rel_json" | grep -q "404"; then
-              rel_json=$(curl -sL "$api" | jq '[.[] | select(.prerelease==false)][0] // .[0]')
-            fi
-            
-            local urls
-            urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
+            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
 
-            [ -z "$urls" ] && { echo "    ⚠️  未获取到任何资产"; return 0; }
+            [ -z "$urls" ] && return 0
 
-            echo "$urls" | while read -r url; do
-              [ -z "$url" ] && continue
-              local name; name=$(basename "$url")
-              if echo "$name" | grep -E -q -i '\.(apk|ipk|zip|tar\.gz|tgz)$'; then
-                if [ -n "$pattern" ]; then
-                  if echo "$name" | grep -E -q -i "$pattern"; then
-                    echo "    下载(命中pattern): $name"
-                    curl -sSL -O "$url" || true
-                  fi
-                else
-                  echo "    下载(全量): $name"
+            for url in $urls; do
+              if [ -n "$pattern" ]; then
+                if echo "$url" | grep -E -i "$pattern"; then
+                  echo "下载包: $url"
+                  curl -sSL -O "$url" || true
+                fi
+              else
+                if echo "$url" | grep -E -i '\.(apk|zip|tar\.gz)$'; then
+                  echo "下载包: $url"
                   curl -sSL -O "$url" || true
                 fi
               fi
             done
           }
 
-          cd packages
-
           # 1) Nikki
-          download_assets "nikkinikki-org/OpenWrt-Nikki" "nikki"
-
+          download_assets "nikkinikki-org/OpenWrt-nikki"
           # 2) MosDNS
-          download_assets "sbwml/luci-app-mosdns" "mosdns|luci"
-
+          download_assets "sbwml/luci-app-mosdns"
           # 3) PassWall 2 离线备用包
-          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || \
-          download_assets "chingu910/openwrt-passwall2" "passwall2" || true
-
+          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || download_assets "chingu910/openwrt-passwall2" "passwall2" || true
           # 4) AdGuard Home LuCI 界面包
-          download_assets "asv1st/luci-app-adguardhome" "adguardhome|luci" || \
-          download_assets "lsong2020/luci-app-adguardhome" "adguardhome|luci" || true
+          download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
 
-          # C. 解压压缩包提取 .apk / .ipk
-          for archive in *.zip *.tar.gz *.tgz; do
+          # C. 解压压缩包提取 .apk
+          for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
-            echo "解压: $archive"
             if [[ "$archive" == *.zip ]]; then
               unzip -o "$archive" || true
-            else
-              tar -xzf "$archive" || true
+            elif [[ "$archive" == *.tar.gz ]]; then
+              tar -zxvf "$archive" || true
             fi
             rm -f "$archive"
           done
 
-          # 扁平化目录结构
-          find . -mindepth 2 -type f \( -name "*.apk" -o -name "*.ipk" \) -exec mv -n {} . \; 2>/dev/null || true
+          find . -mindepth 2 -name "*.apk" -exec mv {} . \; 2>/dev/null || true
+          rm -f *passwall_*.apk 2>/dev/null || true
 
-          # D. 校验架构（注意：此处已修复 local 语法错误）
-          echo "==> 校验 CPU 架构..."
-          for pkg_file in *.apk *.ipk; do
-            [ -f "$pkg_file" ] || continue
-            pkg_arch="unknown"
-            if [[ "$pkg_file" == *.apk ]]; then
-              pkg_arch=$(tar -xzOf "$pkg_file" .PKGINFO 2>/dev/null \
-                | grep -E '^arch =' | head -n1 | cut -d'=' -f2 | tr -d ' ' || true)
+          # D. 校验 CPU 架构 (仅保留 aarch64 / noarch / all / armv8)
+          echo "==> 校验 APK CPU 架构..."
+          for apk_file in *.apk; do
+            [ -f "$apk_file" ] || continue
+            ARCH=$(tar -xzOf "$apk_file" .PKGINFO 2>/dev/null | grep -E '^arch =' | awk -F'=' '{gsub(/ /,"",$2);print $2}' || echo "unknown")
+            [ -z "$ARCH" ] && ARCH="unknown"
+
+            if [[ "$ARCH" != "aarch64" && "$ARCH" != "noarch" && "$ARCH" != "all" && "$ARCH" != "armv8" ]]; then
+              echo "[剔除] 非 ARM64 包: $apk_file (架构: $ARCH)"
+              rm -f "$apk_file"
             else
-              pkg_arch=$(tar -xzOf "$pkg_file" control.tar.gz 2>/dev/null \
-                | tar -xzOf - ./control 2>/dev/null \
-                | grep -E '^Architecture:' | head -n1 | cut -d':' -f2 | tr -d ' ' || true)
+              echo "[保留] $apk_file (架构: $ARCH)"
             fi
-            echo "    $pkg_file => arch=$pkg_arch"
           done
 
-          # 清理明显的异构包
-          for pkg_file in *.apk *.ipk; do
-            [ -f "$pkg_file" ] || continue
-            case "$pkg_file" in
-              *_x86_64_*|*_i386_*|*_arm_cortex*_neon*|*_mipsel_*|*_mips_*)
-                echo "    ❌ 剔除非 ARM64 包: $pkg_file"
-                rm -f "$pkg_file" ;;
-            esac
-          done
-
-          # 仅保留包文件
-          find . -mindepth 1 -not -name "*.apk" -not -name "*.ipk" -delete 2>/dev/null || true
-
           echo "----------------------------------------"
-          echo "本地集成包列表："
-          ls -la *.apk *.ipk 2>/dev/null || echo "(空)"
+          echo "本地集成 APK 列表："
+          ls -la *.apk 2>/dev/null || true
           echo "----------------------------------------"
 
-          cd ..
-
-          # E. 配置 repositories.conf
-          {
-            echo ""
-            echo "# PassWall 2 (允许未签名在线源)"
-            echo "--allow-untrusted https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall2"
-            echo "--allow-untrusted https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall_packages"
-          } >> repositories.conf
-
-          # 添加本地 packages 路径
-          LOCAL_REPO_URL="--allow-untrusted file://${PWD}/packages"
-          echo "$LOCAL_REPO_URL" >> repositories.conf
-
-          # F. 生成并注入签名密钥
-          echo "==> 生成密钥对..."
-          openssl genrsa -out keys/local_key.rsa.pem 2048 2>/dev/null
-          openssl rsa -in keys/local_key.rsa.pem -pubout -out keys/local_key.rsa.pub 2>/dev/null
-          cp keys/local_key.rsa.pub files/etc/apk/keys/local_key.rsa.pub
-
-          # G. 建立 APK 索引与签名
-          echo "==> 生成 APK 索引 (APKINDEX.tar.gz)..."
-          make package_index || true
-
-          if [ -f "packages/APKINDEX.tar.gz" ]; then
-            openssl dgst -sha256 -sign keys/local_key.rsa.pem \
-              -out packages/APKINDEX.tar.gz.sig packages/APKINDEX.tar.gz 2>/dev/null || true
-            cp keys/local_key.rsa.pub packages/local_key.rsa.pub
-            echo "✅ 本地仓库索引签名完毕"
-          fi
-
-          # 写入 apk 容错配置到 overlay 文件系统
-          printf '# 允许安装未签名包\nallow_untrusted = true\n' > files/etc/apk/apk.conf
-
-      # 5. 打包 RootFS (已整合标准 AdGuard Home 安装流程)
-      - name: Build RootFS
+      # 5. 生成统一构建密钥并给所有本地包内嵌重签名 (彻底解决 UNTRUSTED)
+      - name: Sign Local APK Repository
         run: |
           cd builder
 
-          # 强制透传 APK 命令行参数
-          export APK="apk --allow-untrusted"
-          export APK_ARGS="--allow-untrusted"
-          export EXTRA_APK_ARGS="--allow-untrusted"
+          # 定位 ImageBuilder 内置的 apk-tools 签名工具
+          SIGN_BIN=$(find staging_dir -type f -name 'abuild-sign' 2>/dev/null | head -n 1)
+          KEYGEN_BIN=$(find staging_dir -type f -name 'abuild-keygen' 2>/dev/null | head -n 1)
+          echo "abuild-sign   : ${SIGN_BIN:-<not found>}"
+          echo "abuild-keygen : ${KEYGEN_BIN:-<not found>}"
+
+          # A. 生成构建密钥对 key-build(私钥) / key-build.pub(公钥)
+          #    apk 信任约定: 公钥文件名须与签名 key name 一致, 统一命名为 key-build
+          if [ ! -f key-build ] || [ ! -f key-build.pub ]; then
+            echo "==> 生成本地构建密钥 key-build ..."
+            [ -n "$KEYGEN_BIN" ] && { printf 'key-build\n\n\n\n' | sh "$KEYGEN_BIN" -a -n key-build >/dev/null 2>&1 || true; }
+            # 兜底: keygen 不可用时用 openssl 直接生成 (apk 信任的即 RSA 公钥 PEM)
+            if [ ! -f key-build ]; then
+              openssl genrsa -out key-build 2048
+              openssl rsa -in key-build -pubout -out key-build.pub
+            fi
+          fi
+
+          [ -f key-build ]    || { echo "::error::无法生成 key-build 私钥"; exit 1; }
+          [ -f key-build.pub ] || { echo "::error::无法生成 key-build.pub 公钥"; exit 1; }
+
+          # B. 用同一把私钥给 packages/ 下所有第三方 apk 内嵌重签名
+          if [ -n "$SIGN_BIN" ]; then
+            echo "==> 使用 key-build 对本地 APK 内嵌重签名..."
+            sh "$SIGN_BIN" -k "$(pwd)/key-build" -p "$(pwd)/key-build.pub" packages/*.apk || true
+          else
+            echo "::warning::未找到 abuild-sign, 仅依赖 ADD_LOCAL_KEY 兜底"
+          fi
+
+          # C. 把公钥注入镜像信任池 (files/ 会被打进最终 rootfs -> /etc/apk/keys/)
+          mkdir -p files/etc/apk/keys
+          cp -f key-build.pub files/etc/apk/keys/key-build.pub
+          # 同时放入 IB keys/ 目录, 供 make package_index 及构建期验签
+          mkdir -p keys
+          cp -f key-build.pub keys/key-build.pub
+
+          # D. 重建本地仓库索引 packages.adb (由 key-build 签名, 与公钥配对)
+          echo "==> 重新生成 packages.adb 索引 (key-build 签名)..."
+          make package_index || true
+
+          # E. 确保 repositories.conf 含本地仓库条目 (IB 默认已有 /packages, 无则补)
+          grep -qE '^/packages' repositories.conf || printf '\n/packages\n' >> repositories.conf
+
+          echo "=== repositories.conf ==="
+          cat repositories.conf
+          echo "=== keys/ ==="
+          ls -la keys/ || true
+
+      # 6. 集成 AdGuard Home 二进制 (ARM64)
+      - name: Integrate AdGuard Home Binary
+        run: |
+          mkdir -p builder/files/opt
+          AGH_URL="https://github.com/AdguardTeam/AdGuardHome/releases/download/v0.107.77/AdGuardHome_linux_arm64.tar.gz"
+          curl -sSL "$AGH_URL" | tar -zx -C builder/files/opt/
+          chmod +x builder/files/opt/AdGuardHome/AdGuardHome
+
+      # 7. 配置 AdGuard Home 服务自启动
+      - name: Configure AdGuard Home Service
+        run: |
+          mkdir -p builder/files/etc/init.d
+          cat << 'EOF' > builder/files/etc/init.d/adguardhome
+          #!/bin/sh /etc/rc.common
+
+          START=99
+          STOP=10
+
+          USE_PROCD=1
+          PROCD_DEBUG=1
+
+          PROG=/opt/AdGuardHome/AdGuardHome
+          WORK_DIR=/opt/AdGuardHome
+
+          start_service() {
+              procd_open_instance
+              procd_set_param command $PROG -c $WORK_DIR/AdGuardHome.yaml -w $WORK_DIR
+              procd_set_param respawn
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+          EOF
+          chmod +x builder/files/etc/init.d/adguardhome
+
+      # 8. 打包 RootFS
+      - name: Build RootFS
+        run: |
+          cd builder
 
           PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
@@ -227,14 +239,15 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
+          # ADD_LOCAL_KEY=1: 把本地 key-build.pub 写入镜像 /etc/apk/keys/
+          # 配合上一步的内嵌重签名, 编译期与运行期验签均可通过
           make image PROFILE="generic" \
             PACKAGES="$PACKAGES" \
             FILES="files" \
-            APK_ARGS="--allow-untrusted" \
-            EXTRA_APK_ARGS="--allow-untrusted" \
+            ADD_LOCAL_KEY=1 \
             -j$(nproc)
 
-      # 6. 上传 RootFS 编译产物到 Artifacts
+      # 9. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -243,7 +256,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 7. 发布编译产物到 GitHub Releases
+      # 10. 发布编译产物到 GitHub Releases
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
@@ -256,7 +269,7 @@ jobs:
             - **内置组件**:
               - PassWall 2 (`luci-app-passwall2`)
               - Nikki (Mihomo 核心)
-              - MosDNS & AdGuard Home (`adguardhome` + LuCI)
+              - MosDNS & AdGuard Home (`adguardhome` + 命令行二进制)
               - HTTPS / ACME 自动化证书工具链
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
