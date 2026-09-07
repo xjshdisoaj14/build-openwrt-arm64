@@ -3,8 +3,7 @@ name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
 on:
   workflow_dispatch:
   schedule:
-    # 国际标准时间 (UTC) 每偶数月（2、4、6、8、10、12月）的 1 日凌晨 0:00 自动触发编译
-    # 对应北京时间 (UTC+8) 2、4、6、8、10、12月的 1 日上午 08:00
+    # 国际标准时间 (UTC) 每偶数月 1 日 0:00 触发 (北京时间 08:00)
     - cron: '0 0 1 */2 *'
 
 jobs:
@@ -19,14 +18,14 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链
+      # 2. 准备编译工具链与依赖
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
 
-      # 3. 直连提取 ImageBuilder
+      # 3. 提取 ImageBuilder
       - name: Download & Extract ImageBuilder
         run: |
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
@@ -62,64 +61,79 @@ jobs:
             local repo=$1
             echo "==> 正在获取 $repo 的最新 Releases..."
             local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
-            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)')
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
+            
             for url in $urls; do
               echo "正在下载: $url"
               curl -sSL -O "$url"
             done
           }
 
-          # 1) Nikki (内置 Mihomo 核心)
+          # 1) Nikki
           download_latest_assets "nikkinikki-org/OpenWrt-nikki"
 
           # 2) MosDNS
           download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 解压处理
-          for archive in *.tar.gz *.zip; do
-            if [ -f "$archive" ]; then
-              tar -zxvf "$archive" 2>/dev/null || unzip -o "$archive" 2>/dev/null || true
-              rm -f "$archive"
+          # 解压可能包含在压缩包中的软件包
+          for archive in *.zip *.tar.gz; do
+            [ -e "$archive" ] || continue
+            if [[ "$archive" == *.zip ]]; then
+              unzip -o "$archive" || true
+            elif [[ "$archive" == *.tar.gz ]]; then
+              tar -zxvf "$archive" || true
             fi
+            rm -f "$archive"
           done
 
+          # 将嵌套子目录中的 apk 提升到 packages 根目录
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
           echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
-          ls -la *.apk || true
+          ls -la *.apk || echo "未找到 APK 文件！"
 
       # 5. 提取主要组件与内核版本号
       - name: Collect Software Versions
         run: |
-          # 1. 提取内核版本号（从 ImageBuilder 包含的系统配置文件或包列表中查找）
+          # 1. 提取内核版本号
           KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
-          
-          # 2. 提取离线包版本号
-          cd builder/packages
-          NIKKI_VER=$(ls nikki_*.apk 2>/dev/null | head -n1 | sed -E 's/nikki_(.*)_aarch64\.apk/\1/' || echo "最新发布版")
-          LUCI_NIKKI_VER=$(ls luci-app-nikki_*.apk 2>/dev/null | head -n1 | sed -E 's/luci-app-nikki_(.*)_all\.apk/\1/' || echo "最新发布版")
-          MOSDNS_VER=$(ls mosdns_*.apk 2>/dev/null | head -n1 | sed -E 's/mosdns_(.*)_aarch64\.apk/\1/' || echo "最新发布版")
-          
-          # 3. 获取编译当天日期 (UTC+8 北京时间)
-          BUILD_DATE=$(ENV_TZ=Asia/Shanghai date +'%Y-%m-%d')
 
-          # 4. 写入环境变量供后续步骤调用
+          # 2. 提取离线包版本号 (采用兼容性更好的截取算法)
+          cd builder/packages
+          GET_VER() {
+            local pattern=$1
+            local file=$(ls ${pattern}*.apk 2>/dev/null | head -n1)
+            if [ -n "$file" ]; then
+              echo "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$|\.apk$//'
+            else
+              echo "最新发布版"
+            fi
+          }
+
+          NIKKI_VER=$(GET_VER "nikki")
+          LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
+          MOSDNS_VER=$(GET_VER "mosdns")
+
+          # 3. 获取北京时间 (UTC+8)
+          BUILD_DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
+
+          # 4. 写入环境变量
           echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
-          
-          # 写入 Release Body 变量文件
+
+          # 写入 Release Body 说明文件
           cat <<EOF > $GITHUB_WORKSPACE/release_body.md
           ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版构建
-          
+
           - **构建日期**: $BUILD_DATE
           - **构建 ID**: ${{ github.run_id }}
           - **架构 / 包管理器**: ARMSR (ARM64) / APK
-          
+
           ### 📦 核心组件版本清单
           - **Linux Kernel**: \`$KERNEL_VER\`
           - **Nikki Core**: \`$NIKKI_VER\`
           - **LuCI App Nikki**: \`$LUCI_NIKKI_VER\`
           - **MosDNS**: \`$MOSDNS_VER\`
-          
+
           ### 🛠 集成软件列表
           - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS
           - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
@@ -131,8 +145,8 @@ jobs:
         run: |
           cd builder
 
-          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
-            luci \
+          # 构建包清单 (修正了依赖冲突包的强行卸载行为)
+          PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
@@ -143,7 +157,8 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          make image PROFILE="" PACKAGES="$PACKAGES" -j$(nproc)
+          # ARMSR 架构的 Target Profile 通常为 generic
+          make image PROFILE="generic" PACKAGES="$PACKAGES" -j$(nproc)
 
       # 7. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
@@ -154,7 +169,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # 8. 发布编译产物到 GitHub Releases (使用版本信息与日期)
+      # 8. 发布编译产物到 GitHub Releases
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
