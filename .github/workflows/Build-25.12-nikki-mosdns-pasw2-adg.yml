@@ -18,12 +18,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链与依赖
+      # 2. 准备编译工具链与依赖 (已移除不存在的 apk-tools)
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip apk-tools
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
 
       # 3. 提取 ImageBuilder
       - name: Download & Extract ImageBuilder
@@ -61,7 +61,7 @@ jobs:
             local repo=$1
             echo "==> 正在获取 $repo 的最新 Releases..."
             local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
-            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk)' || true)
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
             
             for url in $urls; do
               echo "正在下载: $url"
@@ -75,8 +75,8 @@ jobs:
           # 2) MosDNS
           download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 3) PassWall / PassWall2 (拉取支持 APK 规范的包库)
-          download_latest_assets "xiaorouji/openwrt-passwall"
+          # 3) PassWall (拉取支持 APK 架构编译产物的源)
+          download_latest_assets "chingu910/openwrt-passwall" || download_latest_assets "xiaorouji/openwrt-passwall"
 
           # 4) AdGuardHome (LuCI App)
           download_latest_assets "asv1st/luci-app-adguardhome"
@@ -99,12 +99,6 @@ jobs:
           echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
           ls -la *.apk || echo "未找到 APK 文件！"
           echo "=========================================="
-
-          # 重新建立本地 APK 软件包索引，防止 ImageBuilder 无法识别离线包
-          if command -v apk >/dev/null 2>&1; then
-            echo "==> 正在生成本地 APK 索引文件 (APKINDEX.tar.gz)..."
-            apk index -o APKINDEX.tar.gz *.apk 2>/dev/null || true
-          fi
 
       # 5. 生成自定义系统配置 (修复 uci: command not found 问题的关键)
       - name: Inject Custom Configuration
@@ -133,6 +127,7 @@ jobs:
           [ -f /etc/init.d/nikki ] && /etc/init.d/nikki enable
           [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns enable
           [ -f /etc/init.d/passwall ] && /etc/init.d/passwall enable
+          [ -f /etc/init.d/passwall2 ] && /etc/init.d/passwall2 enable
           [ -f /etc/init.d/adguardhome ] && /etc/init.d/adguardhome enable
 
           exit 0
@@ -197,7 +192,7 @@ jobs:
         run: |
           cd builder
 
-          # 修正后的包列表，使用正确的 luci-app-passwall 及 AdGuard Home
+          # 包含预置 custom files
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
