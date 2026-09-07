@@ -51,37 +51,55 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall2 + AdGuardHome)
+      # 4. 获取并集成第三方离线包 (严格限定 PassWall 2)
       - name: Download & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
           cd builder/packages
 
-          download_latest_assets() {
+          # 通用离线包下载函数
+          download_assets() {
             local repo=$1
-            echo "==> 正在获取 $repo 的最新 Releases..."
+            local pattern=$2
+            echo "==> 正在获取 $repo 的最新 Release 资产 (匹配模式: ${pattern:-全部})..."
             local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
-            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
             
+            if [ -z "$urls" ]; then
+              echo "警告: 未在 $repo 找到有效下载 URL"
+              return 1
+            fi
+
             for url in $urls; do
-              echo "正在下载: $url"
-              curl -sSL -O "$url"
+              if [ -n "$pattern" ]; then
+                if echo "$url" | grep -E -i "$pattern"; then
+                  echo "正在下载匹配包: $url"
+                  curl -sSL -O "$url" || true
+                fi
+              else
+                if echo "$url" | grep -E -i '\.(apk|ipk|zip|tar\.gz)$'; then
+                  echo "正在下载: $url"
+                  curl -sSL -O "$url" || true
+                fi
+              fi
             done
           }
 
           # 1) Nikki
-          download_latest_assets "nikkinikki-org/OpenWrt-nikki"
+          download_assets "nikkinikki-org/OpenWrt-nikki"
 
           # 2) MosDNS
-          download_latest_assets "sbwml/luci-app-mosdns"
+          download_assets "sbwml/luci-app-mosdns"
 
-          # 3) PassWall 2 (多源尝试拉取适配 APK 架构的构建包)
-          download_latest_assets "sbwml/openwrt-passwall" || download_latest_assets "xiaorouji/openwrt-passwall2" || download_latest_assets "chingu910/openwrt-passwall2"
+          # 3) PassWall 2 专用匹配 (严格限制只能下载包含 passwall2 命名的 apk/zip)
+          echo "==> 检索 PassWall 2 专属离线包..."
+          download_assets "chingu910/openwrt-passwall2" "passwall2" || \
+          download_assets "xiaorouji/openwrt-passwall2" "passwall2" || true
 
           # 4) AdGuardHome (LuCI App)
-          download_latest_assets "asv1st/luci-app-adguardhome" || download_latest_assets "lsong2020/luci-app-adguardhome"
+          download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
 
-          # 解压可能包含在 zip/tar.gz 压缩包中的 APK 文件
+          # 解压可能下载到的 zip / tar.gz 归档包
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -92,35 +110,40 @@ jobs:
             rm -f "$archive"
           done
 
-          # 将嵌套子目录中的 apk 提升到 packages 根目录
+          # 将解压后处在子目录中的所有 .apk 文件提升到 packages 根目录
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
+          # 强制清理误刷入的 PassWall 1 代包 (如有)
+          rm -f *passwall_*.apk 2>/dev/null || true
+
+          # 打印当前成功抓取到的 APK 列表
           echo "=========================================="
-          echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
-          ls -la *.apk || echo "未找到 APK 文件！"
+          echo "当前成功集成至 ImageBuilder 本地库的离线 APK 清单："
+          ls -la *.apk || echo "::warning::未找到任何 APK 文件！"
           echo "=========================================="
 
-      # 5. 生成自定义系统配置 (修复 uci: command not found 报错)
+          # 校验 PassWall 2 是否成功落盘
+          if ! ls luci-app-passwall2*.apk >/dev/null 2>&1 && ! ls *passwall2*.apk >/dev/null 2>&1; then
+            echo "::error::未检测到 PassWall 2 (luci-app-passwall2) 的 APK 文件！请检查源中是否有对应 25.12 APK 格式产物。"
+            exit 1
+          fi
+
+      # 5. 生成自定义系统配置
       - name: Inject Custom Configuration
         run: |
-          # 创建 OpenWrt 文件系统预置目录
           FILES_DIR="builder/files/etc/uci-defaults"
           mkdir -p "$FILES_DIR"
 
-          # 注入首次开机初始化脚本 (注意：使用 'EOF' 单引号防止宿主机展开)
           cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
           #!/bin/sh
 
-          # 显式导入完整的系统 PATH，防止 uci-defaults 执行阶段找不到 /sbin/uci
           export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-          # 1. 配置语言与时区
           if command -v uci >/dev/null 2>&1; then
             uci set system.@system[0].timezone='CST-8'
             uci set system.@system[0].zonename='Asia/Shanghai'
             uci commit system
 
-            # 2. 启用 vlmcsd (KMS 服务)
             if [ -f /etc/config/vlmcsd ]; then
               uci set vlmcsd.config.enabled='1'
               uci commit vlmcsd
@@ -135,10 +158,8 @@ jobs:
       # 6. 提取主要组件与内核版本号
       - name: Collect Software Versions
         run: |
-          # 1. 提取内核版本号
           KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
 
-          # 2. 提取离线包版本号
           cd builder/packages
           GET_VER() {
             local pattern=$1
@@ -146,23 +167,19 @@ jobs:
             if [ -n "$file" ]; then
               echo "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$|\.apk$//'
             else
-              echo "已打包/内置"
+              echo "未知"
             fi
           }
 
           NIKKI_VER=$(GET_VER "nikki")
           LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
           MOSDNS_VER=$(GET_VER "mosdns")
-          PASSWALL2_VER=$(GET_VER "luci-app-passwall*")
+          PASSWALL2_VER=$(GET_VER "luci-app-passwall2")
           ADG_VER=$(GET_VER "luci-app-adguardhome")
 
-          # 3. 获取北京时间 (UTC+8)
           BUILD_DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
-
-          # 4. 写入环境变量
           echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
 
-          # 写入 Release Body 说明文件
           cat <<EOF > $GITHUB_WORKSPACE/release_body.md
           ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版构建
 
@@ -179,7 +196,7 @@ jobs:
           - **AdGuard Home**: \`$ADG_VER\`
 
           ### 🛠 集成软件列表
-          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall 2、AdGuard Home
+          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall 2 (luci-app-passwall2)、AdGuard Home
           - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
           - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-nft-socket、kmod-nft-nat、kmod-tun、curl、wget-ssl、yq
           EOF
@@ -189,19 +206,13 @@ jobs:
         run: |
           cd builder
 
-          # 检查本地下载到的 passwall 实际包名 (部分源打包为 luci-app-passwall，部分为 luci-app-passwall2)
-          PASSWALL_PKG="luci-app-passwall2"
-          if ls packages/luci-app-passwall_*.apk >/dev/null 2>&1 && ! ls packages/luci-app-passwall2_*.apk >/dev/null 2>&1; then
-            PASSWALL_PKG="luci-app-passwall"
-          fi
-
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             nikki luci-app-nikki luci-i18n-nikki-zh-cn \
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-            ${PASSWALL_PKG} \
+            luci-app-passwall2 \
             adguardhome luci-app-adguardhome \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
