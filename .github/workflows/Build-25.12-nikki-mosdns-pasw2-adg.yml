@@ -51,18 +51,17 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 配置第三方 PassWall 2 专属 APK 源与离线包集成
-      - name: Configure PassWall2 Repo & Integrate Offline Packages
+      # 4. 配置第三方 APK 源与精准 ARM64 离线包下载
+      - name: Configure Repositories & Integrated ARM64 Packages
         run: |
           mkdir -p builder/packages
           cd builder
 
-          # A. 配置 ImageBuilder 自定义 APK 软件源
-          echo "==> 添加 PassWall 2 认证 APK 软件源..."
+          # A. 配置 PassWall 2 / Nikki / MosDNS 专属 ARM64 软件源 (解决 mihomo、geo2txt 依赖)
+          echo "==> 添加第三方套件认证 APK 软件源..."
           mkdir -p keys
           wget -q -O keys/passwall.pub https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub || true
 
-          # 写入 repositories.conf 文件供 APK 读取
           cat <<EOF >> repositories.conf
           https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall2
           https://sourceforge.net/projects/openwrt-passwall-build/files/releases/packages-25.12/aarch64_cortex-a53/passwall_packages
@@ -70,42 +69,46 @@ jobs:
 
           cd packages
 
-          # 通用离线下载函数
-          download_assets() {
+          # 精准抓取 ARM64 架构离线包函数 (排除 x86_64/x86/x64/amd64)
+          download_arm64_assets() {
             local repo=$1
             local pattern=$2
-            echo "==> 正在获取 $repo 的最新 Release 资产..."
+            echo "==> 检索 $repo 的 ARM64 / ARCH-ALL 离线包..."
             local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
             local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
-            
+
             [ -z "$urls" ] && return 1
 
             for url in $urls; do
+              # 排除一切 x86 / amd64 相关的包，仅匹配 aarch64 或 all 架构
+              if echo "$url" | grep -E -i '(x86|amd64|i386)'; then
+                continue
+              fi
+
               if [ -n "$pattern" ]; then
                 if echo "$url" | grep -E -i "$pattern"; then
-                  echo "正在下载匹配包: $url"
+                  echo "下载匹配包: $url"
                   curl -sSL -O "$url" || true
                 fi
               else
-                if echo "$url" | grep -E -i '\.(apk|ipk|zip|tar\.gz)$'; then
-                  echo "正在下载: $url"
+                if echo "$url" | grep -E -i '(aarch64|armv8|all)\.(apk|zip|tar\.gz)$'; then
+                  echo "下载匹配包: $url"
                   curl -sSL -O "$url" || true
                 fi
               fi
             done
           }
 
-          # B. 抓取 Nikki, MosDNS, AdGuardHome 等常用离线 APK
-          download_assets "nikkinikki-org/OpenWrt-nikki"
-          download_assets "sbwml/luci-app-mosdns"
-          download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
+          # B. 精准拉取 ARM64 / All 架构的组件
+          download_arm64_assets "nikkinikki-org/OpenWrt-nikki"
+          download_arm64_assets "sbwml/luci-app-mosdns"
+          download_arm64_assets "asv1st/luci-app-adguardhome" || download_arm64_assets "lsong2020/luci-app-adguardhome" || true
 
-          # C. 针对 PassWall 2 执行精准离线兜底下载
-          echo "==> 获取 PassWall 2 离线安装包..."
-          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || \
-          download_assets "chingu910/openwrt-passwall2" "passwall2" || true
+          # C. 精准拉取 PassWall 2 的 ARM64 包
+          download_arm64_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || \
+          download_arm64_assets "chingu910/openwrt-passwall2" "passwall2" || true
 
-          # 解压可能包含的压缩包
+          # 解压压缩包
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -116,16 +119,16 @@ jobs:
             rm -f "$archive"
           done
 
-          # 将解压后的子目录 apk 提升到根路径
+          # 整理包路径
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
-          # 关键处理：删除混入的全部第一代 PassWall (.apk)
+          # 二次安全清理：清除所有非 aarch64/all 架构包以及 PassWall 1 代包
+          rm -f *x86*.apk *amd64*.apk 2>/dev/null || true
           rm -f *passwall_*.apk 2>/dev/null || true
-          rm -f luci-app-passwall_*.apk 2>/dev/null || true
 
           echo "=========================================="
-          echo "准备就绪的本地 APK 依赖列表："
-          ls -la *.apk || echo "未提取到本地离线 APK，将完全依赖在线源编译。"
+          echo "通过架构校验的 ARM64 离线 APK 列表："
+          ls -la *.apk || echo "注意: 未搜寻到适合 ARM64 的本地包，依赖项将通过配置的在线源直接拉取。"
           echo "=========================================="
 
       # 5. 注入初始化配置
@@ -155,7 +158,7 @@ jobs:
 
           chmod +x "$FILES_DIR/99-custom-init.sh"
 
-      # 6. 收集编译信息
+      # 6. 收集软件版本信息
       - name: Collect Software Versions
         run: |
           KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
@@ -198,15 +201,15 @@ jobs:
           ### 🛠 集成软件列表
           - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall 2 (luci-app-passwall2)、AdGuard Home
           - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
-          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-nft-socket、kmod-nft-nat、kmod-tun、curl、wget-ssl、yq
+          - **网络增强工具**: nftables、kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun curl wget-ssl yq
           EOF
 
-      # 7. 构建 RootFS 镜像
+      # 7. 打包 RootFS 镜像
       - name: Build RootFS
         run: |
           cd builder
 
-          # 在 PACKAGES 中明确只指定 PassWall 2，拒绝混入一代
+          # 只保留 luci-app-passwall2，由 apk 软件源自动解析核心依赖包
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
