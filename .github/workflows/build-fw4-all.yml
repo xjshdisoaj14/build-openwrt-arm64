@@ -68,7 +68,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall 2 官方仓库)
+      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall 2)
       - name: Download & Integrate Offline Packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,7 +103,7 @@ jobs:
           # 2) MosDNS
           download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 3) PassWall 2 官方指定仓库 (Openwrt-Passwall/openwrt-passwall2)
+          # 3) PassWall 2
           download_latest_assets "Openwrt-Passwall/openwrt-passwall2"
 
           # 解压可能包含离线包的 zip/tar.gz
@@ -175,19 +175,19 @@ jobs:
           }
           EOF
           chmod +x builder/files/etc/init.d/adguardhome
-
-      # 7. 动态打包 RootFS (包含 PassWall 2 + 核心依赖)
+          
+      # 7. 动态打包 RootFS (已清理无效语言包)
       - name: Build RootFS
         run: |
           cd builder
 
-          # 读取 .apk 包内的 .PKGINFO 提取真实包名（自动包含 PassWall 2 并排除多余多国语言包）
+          # 读取 .apk 包内的 .PKGINFO 提取真实包名
           LOCAL_PKGS=""
           if ls packages/*.apk >/dev/null 2>&1; then
             for f in packages/*.apk; do
               P_NAME=$(tar -zxOf "$f" .PKGINFO 2>/dev/null | grep -m1 '^pkgname =' | cut -d'=' -f2 | tr -d ' ' || true)
               if [ -n "$P_NAME" ]; then
-                # 过滤掉非中文的 i18n 语言包，如 -fa, -ru 等
+                # 过滤掉非中文语言包
                 if [[ "$P_NAME" == luci-i18n-*-* ]] && [[ "$P_NAME" != *-zh-cn ]]; then
                   continue
                 fi
@@ -198,7 +198,7 @@ jobs:
 
           echo "自动解析到的本地安装包列表:$LOCAL_PKGS"
 
-          # 基础组件与 PassWall 2 核心运行依赖
+          # 基础软件列表 (移除了不存在的 luci-i18n-adguardhome-zh-cn)
           BASE_PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
             luci \
             luci-i18n-base-zh-cn \
@@ -207,10 +207,8 @@ jobs:
             luci-app-uhttpd luci-i18n-uhttpd-zh-cn \
             luci-app-acme openssl-util px5g-standalone \
             xray-core sing-box chinadns-ng ipt2socks tcping geoview v2ray-geoip v2ray-geosite \
-            luci-app-adguardhome luci-i18n-adguardhome-zh-cn \
-            luci-i18n-smartdns-zh-cn \
+            luci-app-adguardhome \
             luci-app-vlmcsd \
-            luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
@@ -238,10 +236,10 @@ jobs:
             ## ImmortalWrt 25.12.1 (ARMSR / armv8) 自动构建
             - **架构 / 包管理器**: ARMSR (ARM64) / APK
             - **内置核心软件**: 
-              - **PassWall 2** (`luci-app-passwall2` + `luci-i18n-passwall2-zh-cn`)
-              - **Nikki** (Mihomo 核心)
-              - **MosDNS** & **AdGuard Home**
-              - **Web HTTP/HTTPS 管理界面** (uHTTPd 控制台 + ACME 自动化证书)
+              - PassWall 2
+              - Nikki (Mihomo 核心)
+              - MosDNS & AdGuard Home
+              - Web HTTP/HTTPS 管理界面
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
