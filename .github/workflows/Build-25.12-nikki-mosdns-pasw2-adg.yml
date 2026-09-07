@@ -48,13 +48,13 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 精准获取并集成第三方离线包 (Nikki + MosDNS + PassWall 2 + AdGuard Home)
+      # 4. 精准获取离线包 + 生成全信任签名本地仓库
       - name: Download & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
           cd builder
 
-          # A. 配置 PassWall 2 官方认证 APK 在线源并下载 Key
+          # A. 配置 PassWall 2 官方认证 APK 在线源
           mkdir -p keys
           wget -q -O keys/passwall.pub https://sourceforge.net/projects/openwrt-passwall-build/files/apk.pub || true
 
@@ -90,10 +90,10 @@ jobs:
             done
           }
 
-          # 1) Nikki (内置 Mihomo 核心)
+          # 1) Nikki
           download_assets "nikkinikki-org/OpenWrt-nikki"
 
-          # 2) MosDNS (sbwml 维护版)
+          # 2) MosDNS
           download_assets "sbwml/luci-app-mosdns"
 
           # 3) PassWall 2 离线备用包
@@ -102,7 +102,7 @@ jobs:
           # 4) AdGuard Home LuCI 界面包
           download_assets "asv1st/luci-app-adguardhome" || download_assets "lsong2020/luci-app-adguardhome" || true
 
-          # C. 处理解压归档
+          # C. 解压压缩包提取 .apk
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -113,45 +113,56 @@ jobs:
             rm -f "$archive"
           done
 
-          # 确保子目录内的 .apk 文件移动至 packages 根目录
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
-
-          # 剔除 1 代 Passwall 干扰包
           rm -f *passwall_*.apk 2>/dev/null || true
 
-          # D. 【关键逻辑】精准校验 CPU 架构，彻底清除 riscv64/x86 等非法包
-          echo "==> 正在校验所有本地 APK 的真实 CPU 架构 (仅保留 aarch64 / noarch / all)..."
+          # D. 校验 CPU 架构（仅保留 aarch64 / noarch / all）
+          echo "==> 校验 APK CPU 架构..."
           for apk_file in *.apk; do
             [ -f "$apk_file" ] || continue
             ARCH=$(tar -ztvf "$apk_file" .PKGINFO 2>/dev/null && tar -zxvf "$apk_file" .PKGINFO -O 2>/dev/null | grep -E '^arch =' | cut -d'=' -f2 | tr -d ' ' || echo "unknown")
 
             if [[ "$ARCH" != "aarch64" && "$ARCH" != "noarch" && "$ARCH" != "all" && "$ARCH" != "armv8" ]]; then
-              echo "❌ 剔除非 ARM64 包: $apk_file (真实架构: $ARCH)"
+              echo "❌ 剔除非 ARM64 包: $apk_file (架构: $ARCH)"
               rm -f "$apk_file"
             else
-              echo "✅ 留用兼容包: $apk_file (架构: $ARCH)"
+              echo "✅ 保留包: $apk_file (架构: $ARCH)"
             fi
           done
 
-          echo "=========================================="
-          echo "最终集成至 ImageBuilder 本地库的离线 APK 清单："
+          echo "----------------------------------------"
+          echo "本地集成 APK 列表："
           ls -la *.apk || true
-          echo "=========================================="
+          echo "----------------------------------------"
 
-          # E. 生成本地 packages.adb 索引并使用 usign 实施签名认证
+          # E. 【彻底解决 UNTRUSTED 核心方案】生成临时密钥，为 packages.adb 签名并注入系统信任池
           cd ..
-          echo "==> 生成本地包索引..."
+          echo "==> 生成本地签名密钥对..."
+          openssl genrsa -out local_key.pem 2048
+          openssl rsa -in local_key.pem -pubout -out local_key.rsa.pub
+
+          # 创建 APK 部署信任公钥目录
+          mkdir -p keys/
+          mkdir -p staging_dir/target-aarch64_cortex-a53_musl/root-armsr/etc/apk/keys/
+          mkdir -p files/etc/apk/keys/
+
+          # 复制公钥至所有潜在的校验路径
+          cp local_key.rsa.pub keys/local_key.rsa.pub
+          cp local_key.rsa.pub staging_dir/target-aarch64_cortex-a53_musl/root-armsr/etc/apk/keys/local_key.rsa.pub 2>/dev/null || true
+          cp local_key.rsa.pub files/etc/apk/keys/local_key.rsa.pub
+
+          echo "==> 生成 packages.adb 索引并实施 RSA-SHA256 签名..."
           make package_index || true
 
-          echo "==> 为本地索引套用临时密钥进行签名修复..."
-          STAGING_USIGN="./staging_dir/host/bin/usign"
-          if [ -f "$STAGING_USIGN" ]; then
-            $STAGING_USIGN -G -s key.sec -p keys/key.pub
-            $STAGING_USIGN -S -m packages/packages.adb -s key.sec -x packages/packages.adb.sig 2>/dev/null || true
+          # 如果生成了 packages.adb，使用 OpenSSL 强制打上合法签名
+          if [ -f "packages/packages.adb" ]; then
+            openssl dgst -sha256 -sign local_key.pem -out packages/packages.adb.sig packages/packages.adb
+            echo "✅ packages.adb 签名已成功生成 (packages.adb.sig)"
           fi
 
-          # 在 repositories.conf 开启全局未签名容忍选项
-          echo "option allow_untrusted 1" >> repositories.conf || true
+          # 修改 repositories.conf 允许未签名容忍作为双重保险
+          sed -i 's|^/|--allow-untrusted /|g' repositories.conf 2>/dev/null || true
+          echo "option allow_untrusted 1" >> repositories.conf
 
       # 5. 集成 AdGuard Home 二进制 (ARM64)
       - name: Integrate AdGuard Home Binary
@@ -209,7 +220,13 @@ jobs:
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq"
 
-          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" APK_FLAGS="--allow-untrusted" -j$(nproc)
+          # 传入多重 APK 参数确保底层不会因为验证阻断
+          make image PROFILE="generic" \
+            PACKAGES="$PACKAGES" \
+            FILES="files" \
+            APK_ARGS="--allow-untrusted" \
+            EXTRA_APK_ARGS="--allow-untrusted" \
+            -j$(nproc)
 
       # 8. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
