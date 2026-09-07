@@ -51,7 +51,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall 2 + AdGuardHome)
+      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall2 + AdGuardHome)
       - name: Download & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
@@ -75,11 +75,11 @@ jobs:
           # 2) MosDNS
           download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 3) PassWall 2
-          download_latest_assets "Alist-OpenWrt/openwrt-passwall2" || download_latest_assets "chingu910/openwrt-passwall2"
+          # 3) PassWall 2 (多源尝试拉取适配 APK 架构的构建包)
+          download_latest_assets "sbwml/openwrt-passwall" || download_latest_assets "xiaorouji/openwrt-passwall2" || download_latest_assets "chingu910/openwrt-passwall2"
 
           # 4) AdGuardHome (LuCI App)
-          download_latest_assets "asv1st/luci-app-adguardhome"
+          download_latest_assets "asv1st/luci-app-adguardhome" || download_latest_assets "lsong2020/luci-app-adguardhome"
 
           # 解压可能包含在 zip/tar.gz 压缩包中的 APK 文件
           for archive in *.zip *.tar.gz; do
@@ -153,7 +153,7 @@ jobs:
           NIKKI_VER=$(GET_VER "nikki")
           LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
           MOSDNS_VER=$(GET_VER "mosdns")
-          PASSWALL2_VER=$(GET_VER "luci-app-passwall2")
+          PASSWALL2_VER=$(GET_VER "luci-app-passwall*")
           ADG_VER=$(GET_VER "luci-app-adguardhome")
 
           # 3. 获取北京时间 (UTC+8)
@@ -189,14 +189,19 @@ jobs:
         run: |
           cd builder
 
-          # 打包软件列表
+          # 检查本地下载到的 passwall 实际包名 (部分源打包为 luci-app-passwall，部分为 luci-app-passwall2)
+          PASSWALL_PKG="luci-app-passwall2"
+          if ls packages/luci-app-passwall_*.apk >/dev/null 2>&1 && ! ls packages/luci-app-passwall2_*.apk >/dev/null 2>&1; then
+            PASSWALL_PKG="luci-app-passwall"
+          fi
+
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             nikki luci-app-nikki luci-i18n-nikki-zh-cn \
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-            luci-app-passwall2 \
+            ${PASSWALL_PKG} \
             adguardhome luci-app-adguardhome \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
