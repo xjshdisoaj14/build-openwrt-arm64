@@ -1,11 +1,14 @@
-name: Build ImmortalWrt 25.12.1 for OECT (OneCloud)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
 
 on:
   workflow_dispatch:
+  schedule:
+    # 国际标准时间 (UTC) 每偶数月 1 日 0:00 触发 (北京时间 08:00)
+    - cron: '0 0 1 */2 *'
 
 jobs:
   build:
-    name: Build OECT Custom Firmware
+    name: Build ImmortalWrt RootFS
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -15,50 +18,30 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 准备编译工具链
+      # 2. 准备编译工具链与依赖
       - name: Prepare Build Tools
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
-          sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd \
-            gawk qemu-utils dosfstools mtools jq unzip openssl libc6:i386 libstdc++6:i386
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
 
-      # 3. 动态探测并下载 ImageBuilder (增加多路径兼容与强力正则)
-      - name: Download & Extract ImageBuilder for OECT
+      # 3. 提取 ImageBuilder
+      - name: Download & Extract ImageBuilder
         run: |
-          # 候选 Target 路径列表（按优先级排序）
-          PATHS=(
-            "https://downloads.immortalwrt.org/releases/25.12.1/targets/meson/meson8b/"
-            "https://downloads.immortalwrt.org/releases/25.12.1/targets/meson/s80x/"
-            "https://downloads.immortalwrt.org/releases/25.12.1/targets/amlogic/s805/"
-          )
+          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
+          echo "Connecting to target repository: ${TARGET_DIR}"
 
-          IB_FILE=""
-          SELECTED_URL=""
-
-          for TARGET_DIR in "${PATHS[@]}"; do
-            echo "尝试连接目录: ${TARGET_DIR}"
-            HTML_CONTENT=$(curl -sL "$TARGET_DIR" || true)
-            
-            # 使用广度匹配解析文件名
-            IB_NAME=$(echo "$HTML_CONTENT" | grep -i 'imagebuilder' | grep -oE 'immortalwrt-imagebuilder-[^" ]+\.tar\.(zst|xz)' | head -n 1 || true)
-            
-            if [ -n "$IB_NAME" ]; then
-              IB_FILE="$IB_NAME"
-              SELECTED_URL="${TARGET_DIR}${IB_FILE}"
-              echo "✅ 成功匹配到 ImageBuilder: ${SELECTED_URL}"
-              break
-            fi
-          done
+          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
-            echo "::error::在所有已知 Target 目录中均未定位到 ImageBuilder 包！"
+            echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
             exit 1
           fi
 
-          echo "Downloading from: ${SELECTED_URL}"
-          curl -sL "$SELECTED_URL" -o ib_package.archive
+          DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
+          echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
+
+          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
 
           if [[ "$IB_FILE" == *.zst ]]; then
@@ -68,149 +51,414 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 下载第三方包并建立免签本地源
+      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + 独立的 Passwall2)
       - name: Download & Integrate Offline Packages
         run: |
-          set -e
           mkdir -p builder/packages
-          mkdir -p builder/files/etc/apk
+          cd builder/packages
 
-          cd builder
-
-          # 资产获取通用函数
-          download_assets() {
-            local repo="$1"
-            local pattern="${2:-}"
-            echo "==> 正在获取 $repo 的 Release 资产..."
-            local api="https://api.github.com/repos/$repo/releases"
-            local rel_json
-            rel_json=$(curl -sL "$api/latest")
+          download_latest_assets() {
+            local repo=$1
+            echo "==> 正在获取 $repo 的最新 Releases..."
+            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
             
-            if [ -z "$rel_json" ] || echo "$rel_json" | grep -q "404"; then
-              rel_json=$(curl -sL "$api" | jq '[.[] | select(.prerelease==false)][0] // .[0]')
-            fi
-            
-            local urls
-            urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty')
-
-            [ -z "$urls" ] && { echo "    ⚠️ 未获取到任何资产"; return 0; }
-
-            echo "$urls" | while read -r url; do
-              [ -z "$url" ] && continue
-              local name; name=$(basename "$url")
-              if echo "$name" | grep -E -q -i '\.(apk|ipk|zip|tar\.gz|tgz)$'; then
-                if [ -n "$pattern" ]; then
-                  if echo "$name" | grep -E -q -i "$pattern"; then
-                    echo "    下载(命中pattern): $name"
-                    curl -sSL -O "$url" || true
-                  fi
-                else
-                  echo "    下载(全量): $name"
-                  curl -sSL -O "$url" || true
-                fi
-              fi
+            for url in $urls; do
+              echo "正在下载: $url"
+              curl -sSL -O "$url"
             done
           }
 
-          cd packages
+          # 1) Nikki
+          download_latest_assets "nikkinikki-org/OpenWrt-nikki"
 
-          # 下载离线应用包
-          download_assets "nikkinikki-org/OpenWrt-Nikki" "nikki"
-          download_assets "sbwml/luci-app-mosdns" "mosdns|luci"
-          download_assets "Openwrt-Passwall/openwrt-passwall2" "passwall2" || true
-          download_assets "asv1st/luci-app-adguardhome" "adguardhome|luci" || true
+          # 2) MosDNS
+          download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 解压并扁平化存放
-          for archive in *.zip *.tar.gz *.tgz; do
+          # 3) PassWall2 (放入 files/root 目录，巧妙避开 ImageBuilder 签名限制，留到开机安装)
+          mkdir -p ../files/root/pw2
+          echo "==> 正在获取 Openwrt-Passwall/openwrt-passwall2 的最新 Releases..."
+          PW2_JSON=$(curl -sL "https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest")
+          PW2_URLS=$(echo "$PW2_JSON" \vert{} jq -r '.assets[].browser_download_url // empty' \vert{} grep -E '(aarch64\vert{}arm64\vert{}all).*\.apk$')
+          
+          for url in $PW2_URLS; do
+            echo "正在下载 Passwall2: $url"
+            curl -sSL -o "../files/root/pw2/$(basename "$url")" "$url"
+          done
+
+          # 解压可能包含在压缩包中的软件包
+          for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
               unzip -o "$archive" || true
-            else
-              tar -xzf "$archive" || true
+            elif [[ "$archive" == *.tar.gz ]]; then
+              tar -zxvf "$archive" || true
             fi
             rm -f "$archive"
           done
 
-          find . -mindepth 2 -type f \( -name "*.apk" -o -name "*.ipk" \) -exec mv -n {} . \; 2>/dev/null || true
+          # 将嵌套子目录中的 apk 提升到 packages 根目录
+          find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
-          # 剔除非 ARM32 包（玩客云为 ARMv7 架构）
-          for pkg_file in *.apk *.ipk; do
-            [ -f "$pkg_file" ] || continue
-            case "$pkg_file" in
-              *_x86_64_*|*_i386_*|*_aarch64_*|*_mips_*)
-                echo "    ❌ 剔除非 ARM32 包: $pkg_file"
-                rm -f "$pkg_file" ;;
-            esac
-          done
+          echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
+          ls -la *.apk || echo "未找到 APK 文件！"
 
-          cd ..
+      # 5. 生成自定义系统配置 (包含利用 --allow-untrusted 解决签名坑的核心逻辑)
+      - name: Inject Custom Configuration
+        run: |
+          # 创建 OpenWrt 文件系统预置目录
+          FILES_DIR="builder/files/etc/uci-defaults"
+          mkdir -p "$FILES_DIR"
 
-          # 将本地包路径追加到 repositories.conf，附加 --allow-untrusted 跳过校验
-          LOCAL_REPO_URL="--allow-untrusted file://${PWD}/packages"
-          echo "$LOCAL_REPO_URL" >> repositories.conf
+          # 注入首次开机初始化脚本
+          cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
+          #!/bin/sh
 
-          # 使用 ImageBuilder 内部命令建立包索引
-          make package_index || true
+          # 1. 配置语言与时区
+          uci set system.@system[0].timezone='CST-8'
+          uci set system.@system[0].zonename='Asia/Shanghai'
+          uci commit system
 
-          # 配置 RootFS 内置 apk 允许未签名安装
-          printf 'allow_untrusted = true\n' > files/etc/apk/apk.conf
+          # 2. 启用 vlmcsd (KMS 服务)
+          if [ -f /etc/config/vlmcsd ]; then
+            uci set vlmcsd.config.enabled='1'
+            uci commit vlmcsd
+          fi
 
-      # 5. 构建玩客云 (OECT / OneCloud) 固件
-      - name: Build OECT Image
+          # 3. 首次开机本地离线安装 PassWall2 (绕过官方密钥限制)
+          if ls /root/pw2/*.apk >/dev/null 2>&1; then
+            echo "Installing PassWall2 with --allow-untrusted..."
+            # 尝试拉取最新依赖源，如果机器尚未联网报错也不影响后续强行安装本地包
+            apk update || true
+            # 此处满足要求：安装未签名的第三方 Passwall2 apk
+            apk add --allow-untrusted /root/pw2/*.apk
+            # 安装完成后删除残留安装包释放空间
+            rm -rf /root/pw2
+          fi
+
+          # 4. 启用服务自启（软链接方式兜底）
+          [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
+          [ -f /etc/init.d/nikki ] && /etc/init.d/nikki enable
+          [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns enable
+          [ -f /etc/init.d/passwall ] && /etc/init.d/passwall enable
+          [ -f /etc/init.d/passwall2 ] && /etc/init.d/passwall2 enable
+
+          exit 0
+          EOF
+
+          chmod +x "$FILES_DIR/99-custom-init.sh"
+
+      # 6. 提取主要组件与内核版本号
+      - name: Collect Software Versions
+        run: |
+          # 1. 提取内核版本号
+          KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
+
+          # 2. 提取离线包版本号
+          cd builder/packages
+          GET_VER() {
+            local pattern=$1
+            local file=$(ls${pattern}*.apk 2>/dev/null | head -n1)
+            if [ -n "$file" ]; then
+              echo "$file" \vert{} sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$\vert{}\.apk$//'
+            else
+              echo "最新发布版"
+            fi
+          }
+
+          NIKKI_VER=$(GET_VER "nikki")
+          LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
+          MOSDNS_VER=$(GET_VER "mosdns")
+
+          # 单独获取放进 root 的 Passwall2 版本
+          PW2_APK=$(ls ../files/root/pw2/luci-app-passwall2*.apk 2>/dev/null | head -n1)
+          if [ -n "$PW2_APK" ]; then
+            PW2_VER=$(basename "$PW2_APK" | sed -E 's/luci-app-passwall2_(.*)_all\.apk/\1/')
+          else
+            PW2_VER="最新发布版"
+          fi
+
+          # 3. 获取北京时间 (UTC+8)
+          BUILD_DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
+
+          # 4. 写入环境变量
+          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
+
+          # 写入 Release Body 说明文件
+          cat <<EOF > $GITHUB_WORKSPACE/release_body.md
+          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版构建
+
+          - **构建日期**: $BUILD_DATE
+          - **构建 ID**: ${{ github.run_id }}
+          - **架构 / 包管理器**: ARMSR (ARM64) / APK
+
+          ### 📦 核心组件版本清单
+          - **Linux Kernel**: \`$KERNEL_VER\`
+          - **Nikki Core**: \`$NIKKI_VER\`
+          - **LuCI App Nikki**: \`$LUCI_NIKKI_VER\`
+          - **MosDNS**: \`$MOSDNS_VER\`
+          - **PassWall2**: \`$PW2_VER\`
+
+          ### 🛠 集成软件列表
+          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall2
+          - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
+          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-tun、curl、wget-ssl、yq
+          EOF
+
+      # 7. 打包 RootFS
+      - name: Build RootFS
         run: |
           cd builder
 
-          export APK="apk --allow-untrusted"
-          export APK_ARGS="--allow-untrusted"
-          export EXTRA_APK_ARGS="--allow-untrusted"
+          # 包含预置 custom files (包含 uci-defaults 初始化脚本)
+          # 注意：为了防止首次开机断网导致 passwall2 缺少依赖安装失败，此处预先打包 passwall2 的核心依赖
+          PACK为了完美满足你提出的所有硬性要求（安装 Passwall2、使用可靠源、绕过非官方签名的坑、使用 `apk add --allow-untrusted` 原则、且尽量不改动原代码架构），我为你优化了这段 GitHub Actions 源码。
 
-          # 适合玩客云 512M 内存的精简组件列表
-          PACKAGES="-odhcp6c -odhcpd-ipv6only -kmod-ipv6 \
-            luci \
+### 核心解决思路与改动点：
+
+1. **寻找合适源 (PassWall2 专属)**：采用目前官方权威且专门针对新版 APK 包管理维护的库 `Openwrt-Passwall/openwrt-passwall2`，直接从最新的 Release 提取 `.apk` 进行集成。
+2. **规避 ImageBuilder 签名报错机制**：ImageBuilder 在执行 `make image` 时，一旦将非官方签名的第三方 APK 强行塞入 `PACKAGES` 变量进行底层编译，会直接触发密钥不匹配报错而中断。
+3. **贯彻 `--allow-untrusted` 原则**：为了原汁原味地遵守你强调的这个参数，我**巧妙地将 Passwall2 的 `.apk` 包预先存放入系统的 `/root/passwall2` 目录**。随后，通过你原有的首次开机初始化脚本 (`99-custom-init.sh`)，在系统首次启动时触发执行 `apk add --allow-untrusted` 进行离线安装。这种“曲线救国”的方式完美绕过了 ImageBuilder 的编译环境签名校验，又满足了你的所有原则。
+4. **依赖包预打包**：在 `make image` 步骤，我将 Passwall2 依赖的环境底包（如 `xray-core`、`sing-box`、`luci-compat` 等）通过 `PACKAGES` 注入进固件。这样首次开机执行 `apk add` 安装 PassWall2 时就不会因为缺依赖而报错。
+
+### 优化后的完整 Workflow 代码如下：
+
+```yaml
+name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 国际标准时间 (UTC) 每偶数月 1 日 0:00 触发 (北京时间 08:00)
+    - cron: '0 0 1 */2 *'
+
+jobs:
+  build:
+    name: Build ImmortalWrt RootFS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # 1. 拉取仓库代码
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. 准备编译工具链与依赖
+      - name: Prepare Build Tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get update
+          sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
+
+      # 3. 提取 ImageBuilder
+      - name: Download & Extract ImageBuilder
+        run: |
+          TARGET_DIR="[https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/](https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/)"
+          echo "Connecting to target repository: ${TARGET_DIR}"
+
+          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+
+          if [ -z "$IB_FILE" ]; then
+            echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
+            exit 1
+          fi
+
+          DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
+          echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
+
+          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
+          mkdir -p builder
+
+          if [[ "$IB_FILE" == *.zst ]]; then
+            tar --zstd -xf ib_package.archive -C builder --strip-components=1
+          else
+            tar -xf ib_package.archive -C builder --strip-components=1
+          fi
+          rm -f ib_package.archive
+
+      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall2)
+      - name: Download & Integrate Offline Packages
+        run: |
+          mkdir -p builder/packages
+          cd builder/packages
+
+          download_latest_assets() {
+            local repo=$1
+            echo "==> 正在获取 $repo 的最新 Releases..."
+            local rel_json=$(curl -sL "[https://api.github.com/repos/$repo/releases/latest](https://api.github.com/repos/$repo/releases/latest)")
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|arm64|all|\.apk|\.ipk)' || true)
+            
+            for url in $urls; do
+              echo "正在下载: $url"
+              curl -sSL -O "$url"
+            done
+          }
+
+          # 1) Nikki
+          download_latest_assets "nikkinikki-org/OpenWrt-nikki"
+
+          # 2) MosDNS
+          download_latest_assets "sbwml/luci-app-mosdns"
+
+          # 解压可能包含在压缩包中的软件包 (针对 Nikki/MosDNS)
+          for archive in *.zip *.tar.gz; do
+            [ -e "$archive" ] || continue
+            if [[ "$archive" == *.zip ]]; then
+              unzip -o "$archive" || true
+            elif [[ "$archive" == *.tar.gz ]]; then
+              tar -zxvf "$archive" || true
+            fi
+            rm -f "$archive"
+          done
+
+          # 将嵌套子目录中的 apk 提升到 packages 根目录
+          find . -mindepth 2 -name "*.apk" -exec mv {} . \;
+
+          echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
+          ls -la *.apk || echo "未找到 APK 文件！"
+          
+          # 3) 独立下载 PassWall2 以避开 ImageBuilder 的签名校验坑
+          # 我们将其放入 files/root/passwall2 目录下，通过 init 脚本配合 --allow-untrusted 安装
+          echo "==> 正在获取 PassWall2 (Openwrt-Passwall/openwrt-passwall2)..."
+          mkdir -p ../files/root/passwall2
+          PASSWALL2_JSON=$(curl -sL "[https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest](https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest)")
+          PASSWALL2_URLS=$(echo "$PASSWALL2_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E 'luci-(app|i18n)-passwall2.*\.apk' || true)
+          for url in $PASSWALL2_URLS; do
+            echo "正在下载 PassWall2: $url"
+            curl -sSL -o "../files/root/passwall2/$(basename "$url")" "$url"
+          done
+
+      # 5. 生成自定义系统配置 (修复 uci 命令并注入 apk add --allow-untrusted 原则)
+      - name: Inject Custom Configuration
+        run: |
+          FILES_DIR="builder/files/etc/uci-defaults"
+          mkdir -p "$FILES_DIR"
+
+          cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
+          #!/bin/sh
+
+          # 1. 配置语言与时区
+          uci set system.@system[0].timezone='CST-8'
+          uci set system.@system[0].zonename='Asia/Shanghai'
+          uci commit system
+
+          # 2. 启用 vlmcsd (KMS 服务)
+          if [ -f /etc/config/vlmcsd ]; then
+            uci set vlmcsd.config.enabled='1'
+            uci commit vlmcsd
+          fi
+
+          # 3. 严格遵守原则：使用 --allow-untrusted 安装未签名的第三方 PassWall2 源包
+          # (系统底层依赖环境已预装在系统内，此处仅安装存在签名坑的 UI 壳及汉化包)
+          if ls /root/passwall2/*.apk >/dev/null 2>&1; then
+            echo "正在离线安装 PassWall2..." > /dev/console
+            apk add --allow-untrusted /root/passwall2/*.apk
+            rm -rf /root/passwall2
+          fi
+
+          # 4. 启用服务自启（软链接方式兜底）
+          [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
+          [ -f /etc/init.d/nikki ] && /etc/init.d/nikki enable
+          [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns enable
+          [ -f /etc/init.d/passwall2 ] && /etc/init.d/passwall2 enable
+
+          exit 0
+          EOF
+
+          chmod +x "$FILES_DIR/99-custom-init.sh"
+
+      # 6. 提取主要组件与内核版本号
+      - name: Collect Software Versions
+        run: |
+          # 1. 提取内核版本号
+          KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
+
+          # 2. 提取离线包版本号
+          cd builder/packages
+          GET_VER() {
+            local pattern=$1
+            local file=$(ls ${pattern}*.apk 2>/dev/null | head -n1)
+            if [ -n "$file" ]; then
+              echo "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$|\.apk$//'
+            else
+              echo "最新发布版"
+            fi
+          }
+
+          NIKKI_VER=$(GET_VER "nikki")
+          LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
+          MOSDNS_VER=$(GET_VER "mosdns")
+          
+          # 提取 PassWall2 版本号 (它被安全隔离在了 files 目录下)
+          PASSWALL2_VER=$(ls ../files/root/passwall2/luci-app-passwall2*.apk 2>/dev/null | head -n1 | sed -E 's/.*luci-app-passwall2_([^_]+)_all\.apk/\1/')
+          [ -z "$PASSWALL2_VER" ] && PASSWALL2_VER="最新发布版"
+
+          # 3. 获取北京时间 (UTC+8)
+          BUILD_DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
+
+          # 4. 写入环境变量
+          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
+
+          # 写入 Release Body 说明文件
+          cat <<EOF> $GITHUB_WORKSPACE/release_body.md
+          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版构建
+
+          - **构建日期**: $BUILD_DATE
+          - **构建 ID**: ${{ github.run_id }}
+          - **架构 / 包管理器**: ARMSR (ARM64) / APK
+
+          ### 📦 核心组件版本清单
+          - **Linux Kernel**: \`$KERNEL_VER\`
+          - **Nikki Core**: \`$NIKKI_VER\`
+          - **LuCI App Nikki**: \`$LUCI_NIKKI_VER\`
+          - **MosDNS**: \`$MOSDNS_VER\`
+          - **PassWall2**: \`$PASSWALL2_VER\`
+
+          ### 🛠 集成软件列表
+          - **代理与 DNS**: PassWall2, Nikki, MosDNS
+          - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
+          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-tun、curl、wget-ssl、yq
+          EOF
+
+      # 7. 打包 RootFS
+      - name: Build RootFS
+        run: |
+          cd builder
+
+          # 包含预置 custom files (其中含有 uci-defaults 初始化脚本与 PassWall2 安装包)
+          # 注意新增的 PassWall2 依赖核心(xray-core、sing-box、luci-compat 等)必须加入 PACKAGES 保证内置进底层
+          PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             nikki luci-app-nikki luci-i18n-nikki-zh-cn \
             mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
-            luci-app-passwall2 luci-i18n-passwall2-zh-cn \
-            adguardhome luci-app-adguardhome \
-            luci-app-acme luci-i18n-acme-zh-cn openssl-util \
+            luci-app-vlmcsd \
+            luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
-            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun"
+            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq \
+            xray-core sing-box tcping unzip resolveip luci-compat"
 
-          # 动态获取 Profile 名称
-          PROFILE_NAME=$(make info | grep -oE 'xunlei_onecloud|onecloud|onecloud-oect' | head -n 1)
-          if [ -z "$PROFILE_NAME" ]; then
-            PROFILE_NAME="xunlei_onecloud"
-          fi
-          echo "Selected Profile: $PROFILE_NAME"
+          make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-          make image PROFILE="$PROFILE_NAME" \
-            PACKAGES="$PACKAGES" \
-            FILES="files" \
-            APK_ARGS="--allow-untrusted" \
-            EXTRA_APK_ARGS="--allow-untrusted" \
-            -j$(nproc)
-
-      # 6. 上传编译产物
-      - name: Upload OECT Artifacts
+      # 8. 上传 RootFS 编译产物到 Artifacts
+      - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-oect-onecloud
-          path: builder/bin/targets/*/*/*
+          name: immortalwrt-25.12.1-armsr-rootfs-optimize-${{ env.BUILD_DATE }}
+          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 7. 发布 Release
-      - name: Upload to GitHub Release
+      # 9. 发布编译产物到 GitHub Releases
+      - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
-        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
         with:
-          tag_name: OECT-ImmortalWrt-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 for OECT (OneCloud)
-          body: |
-            ## OECT (玩客云 OneCloud) 专用固件
-            - **特点**: 基于 25.12.1 适配 S805 平台，集成基础代理与 DNS 优化套件。
-          files: builder/bin/targets/*/*/*
+          tag_name: ImmortalWrt-25.12.1-${{ env.BUILD_DATE }}-${{ github.run_id }}
+          name: ImmortalWrt 25.12.1 ARMSR RootFS Optimize (${{ env.BUILD_DATE }})
+          body_path: release_body.md
+          files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
