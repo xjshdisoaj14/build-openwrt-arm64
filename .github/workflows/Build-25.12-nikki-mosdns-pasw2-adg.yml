@@ -59,7 +59,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 下载第三方 Release 包并拷贝到 ImageBuilder 目录 (精准过滤非 ARM64/all 资产)
+      # 4. 下载第三方 Release 包并拷贝到 ImageBuilder 目录 (白名单匹配 aarch64 / all)
       - name: Download Third-Party Packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -76,13 +76,13 @@ jobs:
             local raw_urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' || true)
 
             for url in $raw_urls; do
-              # 关键修复：在下载阶段就剔除显式包含非 ARM64 架构关键字的资源包，防止解压时同名覆盖 ARM64 包
-              if echo "$url" | grep -qiE 'x86_64|x86|i386|i686|ramips|mipsel|mips|fa526|cortex|armv7|armv6|riscv64|loongarch'; then
-                echo "跳过异构资产: $url"
-                continue
+              # 白名单过滤：仅下载文件名中明确包含 aarch64 或 all 的包/压缩包
+              if echo "$url" | grep -qiE 'aarch64|all'; then
+                echo "正在下载 ARM64/通用资产: $url"
+                curl -sSL -O "$url"
+              else
+                echo "跳过非目标架构资产: $url"
               fi
-              echo "正在下载 ARM64/通用资产: $url"
-              curl -sSL -O "$url"
             done
           }
 
@@ -91,24 +91,21 @@ jobs:
           download_latest_apk "sbwml/luci-app-mosdns"
           download_latest_apk "Openwrt-Passwall/openwrt-passwall2"
 
-          # 解压所有下载好的压缩包
-          find . -type f -name "*.zip" -exec unzip -o {} \; >/dev/null 2>&1 || true
-          find . -type f -name "*.tar.gz" -exec tar -zxvf {} \; >/dev/null 2>&1 || true
+          # 解压到独立目录，防止覆盖
+          mkdir -p extracted
+          find . -maxdepth 1 -type f -name "*.zip" -exec unzip -o {} -d extracted/ \; >/dev/null 2>&1 || true
+          find . -maxdepth 1 -type f -name "*.tar.gz" -exec tar -zxvf {} -C extracted/ \; >/dev/null 2>&1 || true
 
-          # 移动所有解压出的 .apk 到 builder/packages/
+          # 将所有 valid .apk 移动到 builder/packages/
           find . -type f -name "*.apk" | while read -r apk_file; do
-            if echo "$apk_file" | grep -qiE 'x86_64|i386|i686|ramips|mipsel|mips|fa526|cortex|armv7|armv6|riscv64|loongarch'; then
-              echo "跳过异构文件: $apk_file"
-            else
-              echo "放入 packages 目录: $apk_file"
-              cp -f "$apk_file" "../$PKGS_DIR/"
-            fi
+            echo "放入 packages 目录: $apk_file"
+            cp -f "$apk_file" "../$PKGS_DIR/"
           done
 
           cd ..
           rm -rf dl_temp
 
-      # 5. 配置 ImageBuilder 兼容架构 (保持原样，只保留通用 ARM64 架构)
+      # 5. 配置 ImageBuilder 兼容架构
       - name: Patch APK Architectures & System Configuration
         run: |
           mkdir -p builder/etc/apk
@@ -216,7 +213,7 @@ jobs:
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-          # 删除多余的 targz-rootfs.tar.gz，避免重复上传导致体积翻倍
+          # 删除多余的 targz-rootfs.tar.gz
           rm -f bin/targets/armsr/armv8/*targz*.tar.gz
 
       # 9. 上传 RootFS Artifact
