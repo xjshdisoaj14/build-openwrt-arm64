@@ -59,7 +59,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取第三方离线包并直接注入 ImageBuilder 软件包仓库
+      # 4. 严格按照 aarch64/all 白名单下载第三方离线包
       - name: Download Third-Party Packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,8 +74,8 @@ jobs:
             echo "==> 正在获取 $repo 的最新 Release 包..."
             local rel_json=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/releases/latest")
             
-            # 提取适合 ARM64 的包
-            local urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' | grep -vE '(x86_64|ramips|mipsel|i386|armv7)' || true)
+            # 使用严格白名单，只提取包含 aarch64 或 all 架构的包，彻底隔离 arm_fa526 等非兼容架构
+            local urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' | grep -iE '(aarch64|all)' || true)
 
             for url in $urls; do
               echo "正在下载: $url"
@@ -96,34 +96,33 @@ jobs:
           find . -name "*.zip" -exec unzip -o {} \;
           find . -name "*.tar.gz" -exec tar -zxvf {} \;
 
-          # 移动所有的 .apk 包到 ImageBuilder 的 packages 目录
+          # 仅移动 aarch64 和 all 架构的 .apk 包到 ImageBuilder 仓库
           find . -type f -name "*.apk" | while read -r apk_file; do
-            if echo "$apk_file" | grep -qE 'x86_64|ramips|mipsel|i386|armv7'; then
-              continue
+            if echo "$apk_file" | grep -iE 'aarch64|all'; then
+              mv "$apk_file" "../$PKGS_DIR/"
             fi
-            mv "$apk_file" "../$PKGS_DIR/"
           done
 
           cd ..
           rm -rf dl_temp
 
-      # 5. 修正第三方 APK 架构限制，防止 ImageBuilder 报 uninstallable 错误
+      # 5. 修正第三方 APK 架构限制并注入 ImageBuilder 兼容配置
       - name: Patch APK Architectures & System Configuration
         run: |
-          # 1. 扩充 ImageBuilder 的 APK 兼容架构配置
+          # 1. 扩充 ImageBuilder 的 APK 兼容架构列表
           mkdir -p builder/etc/apk
-          echo "aarch64_generic" >> builder/etc/apk/arch
+          echo "aarch64_generic" > builder/etc/apk/arch
           echo "aarch64_cortex-a72" >> builder/etc/apk/arch
           echo "aarch64_cortex-a53" >> builder/etc/apk/arch
+          echo "all" >> builder/etc/apk/arch
 
-          # 2. 解包修正 packages 目录下所有 .apk 的 .PKGINFO 架构标识
+          # 2. 解包将所有第三方包的 .PKGINFO 架构统一修正为 aarch64_generic
           cd builder/packages
           for apk in *.apk; do
             [ -f "$apk" ] || continue
             mkdir -p tmp_apk
             tar -xf "$apk" -C tmp_apk 2>/dev/null || continue
             if [ -f tmp_apk/.PKGINFO ]; then
-              # 将具体的 cortex-a72 等架构统一修改为通用 aarch64_generic
               sed -i -E 's/arch = .*/arch = aarch64_generic/g' tmp_apk/.PKGINFO
               (cd tmp_apk && tar -zcf "../$apk" ./* .PKGINFO 2>/dev/null)
             fi
@@ -209,12 +208,11 @@ jobs:
           - **底层依赖**: nftables、kmod-nft-tproxy、kmod-tun、xray-core、sing-box、curl、wget-ssl、yq
           EOF
 
-      # 8. 直接将所有软件打包进固件 RootFS
+      # 8. 打包 RootFS 并清理冗余的 targz 镜像
       - name: Build RootFS
         run: |
           cd builder
 
-          # 在 PACKAGES 中包含所有核心包、第三方应用以及 PassWall2
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
@@ -230,23 +228,26 @@ jobs:
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 9. 上传 RootFS 编译产物到 Artifacts
+          # 删除多余的 targz 格式 RootFS 镜像，只保留唯一标准的 generic-rootfs.tar.gz
+          rm -f bin/targets/armsr/armv8/*targz*.tar.gz
+
+      # 9. 上传仅包含 generic-rootfs.tar.gz 的产物到 Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-armsr-full-suite-${{ env.BUILD_DATE }}
-          path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+          name: immortalwrt-25.12.1-armsr-generic-rootfs-${{ env.BUILD_DATE }}
+          path: builder/bin/targets/armsr/armv8/*generic-rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 10. 发布编译产物到 GitHub Releases
+      # 10. 发布仅包含 generic-rootfs.tar.gz 到 GitHub Releases
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
         with:
           tag_name: ImmortalWrt-25.12.1-${{ env.BUILD_DATE }}-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 ARMSR Full Suite (${{ env.BUILD_DATE }})
+          name: ImmortalWrt 25.12.1 ARMSR Generic RootFS (${{ env.BUILD_DATE }})
           body_path: release_body.md
-          files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
+          files: builder/bin/targets/armsr/armv8/*generic-rootfs.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
