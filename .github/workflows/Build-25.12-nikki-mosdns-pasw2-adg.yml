@@ -59,7 +59,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 下载第三方 Release 包并拷贝到 ImageBuilder 目录 (过滤掉非 ARM64 架构)
+      # 4. 下载第三方 Release 包并拷贝到 ImageBuilder 目录 (精准过滤非 ARM64/all 资产)
       - name: Download Third-Party Packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -73,10 +73,15 @@ jobs:
             local repo=$1
             echo "==> 正在获取 $repo 的最新 Release 包..."
             local rel_json=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/releases/latest")
-            local urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' || true)
+            local raw_urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' || true)
 
-            for url in $urls; do
-              echo "正在下载: $url"
+            for url in $raw_urls; do
+              # 关键修复：在下载阶段就剔除显式包含非 ARM64 架构关键字的资源包，防止解压时同名覆盖 ARM64 包
+              if echo "$url" | grep -qiE 'x86_64|x86|i386|i686|ramips|mipsel|mips|fa526|cortex|armv7|armv6|riscv64|loongarch'; then
+                echo "跳过异构资产: $url"
+                continue
+              fi
+              echo "正在下载 ARM64/通用资产: $url"
               curl -sSL -O "$url"
             done
           }
@@ -86,13 +91,13 @@ jobs:
           download_latest_apk "sbwml/luci-app-mosdns"
           download_latest_apk "Openwrt-Passwall/openwrt-passwall2"
 
-          # 解压所有压缩包
+          # 解压所有下载好的压缩包
           find . -type f -name "*.zip" -exec unzip -o {} \; >/dev/null 2>&1 || true
           find . -type f -name "*.tar.gz" -exec tar -zxvf {} \; >/dev/null 2>&1 || true
 
-          # 移动 .apk 到 builder/packages/，仅排除异构平台 (x86_64, fa526, armv7 等)
+          # 移动所有解压出的 .apk 到 builder/packages/
           find . -type f -name "*.apk" | while read -r apk_file; do
-            if echo "$apk_file" | grep -qiE 'x86_64|i386|i686|ramips|mipsel|mips|fa526|cortex-a7|cortex-a9|cortex-a15|armv7|armv6|riscv64|loongarch'; then
+            if echo "$apk_file" | grep -qiE 'x86_64|i386|i686|ramips|mipsel|mips|fa526|cortex|armv7|armv6|riscv64|loongarch'; then
               echo "跳过异构文件: $apk_file"
             else
               echo "放入 packages 目录: $apk_file"
@@ -103,7 +108,7 @@ jobs:
           cd ..
           rm -rf dl_temp
 
-      # 5. 配置 ImageBuilder 兼容架构 (已按要求移除 aarch64_cortex-a53)
+      # 5. 配置 ImageBuilder 兼容架构 (保持原样，只保留通用 ARM64 架构)
       - name: Patch APK Architectures & System Configuration
         run: |
           mkdir -p builder/etc/apk
