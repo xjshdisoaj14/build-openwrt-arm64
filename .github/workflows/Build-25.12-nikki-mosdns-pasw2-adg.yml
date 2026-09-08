@@ -25,16 +25,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make build-essential curl wget tar xz-utils zstd gawk qemu-utils dosfstools mtools jq unzip
 
-      # 3. 提取 ImageBuilder
+# 3. 提取 ImageBuilder (增强容错与自动判断)
       - name: Download & Extract ImageBuilder
         run: |
-          TARGET_DIR="[https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/](https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/)"
-          echo "Connecting to target repository: ${TARGET_DIR}"
+          # 1. 优先尝试指定的 25.12.1，若不存在则回退至 snapshots 或已发布的最新版
+          TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
+          
+          # 检查目录 HTTP 响应状态
+          HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" "$TARGET_DIR")
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::warning::目标路径 $TARGET_DIR 返回 HTTP $HTTP_CODE，尝试使用 snapshots 路径..."
+            TARGET_DIR="https://downloads.immortalwrt.org/snapshots/targets/armsr/armv8/"
+          fi
 
-          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+          echo "Connecting to target repository: ${TARGET_DIR}"
+          HTML_CONTENT=$(curl -sL "$TARGET_DIR")
+
+          # 2. 扩大正则匹配范围（兼容 immortalwrt 与 openwrt 命名，兼容 zst/xz/gz/bz2 格式）
+          IB_FILE=$(echo "$HTML_CONTENT" | grep -oE '(immortalwrt|openwrt)-imagebuilder-[^"]+\.tar\.(zst|xz|gz|bz2)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
-            echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
+            echo "::error::无法在 ${TARGET_DIR} 找到 ImageBuilder！"
+            echo "页面返回内容片段："
+            echo "$HTML_CONTENT" | head -n 30
             exit 1
           fi
 
