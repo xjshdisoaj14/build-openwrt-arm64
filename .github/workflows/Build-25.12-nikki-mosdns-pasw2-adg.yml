@@ -59,8 +59,8 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取第三方 Release 包并精准过滤出 ARM64 / All 架构
-      - name: Download Third-Party Packages
+      # 4. 下载第三方 Release 资源并进行无损精准架构筛选 (仅保留 ARM64 / all)
+      - name: Download & Filter Third-Party Packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -69,11 +69,10 @@ jobs:
           mkdir -p dl_temp
           cd dl_temp
 
-          download_latest_apk() {
+          download_latest_assets() {
             local repo=$1
-            echo "==> 正在获取 $repo 的最新 Release 包..."
+            echo "==> 正在获取 $repo 的最新 Release 资源..."
             local rel_json=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/releases/latest")
-            
             local urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' || true)
 
             for url in $urls; do
@@ -82,63 +81,74 @@ jobs:
             done
           }
 
-          # 1) Nikki
-          download_latest_apk "nikkinikki-org/OpenWrt-nikki"
+          # 下载主要仓库的 Release 包
+          download_latest_assets "nikkinikki-org/OpenWrt-nikki"
+          download_latest_assets "sbwml/luci-app-mosdns"
+          download_latest_assets "Openwrt-Passwall/openwrt-passwall2"
 
-          # 2) MosDNS
-          download_latest_apk "sbwml/luci-app-mosdns"
+          # 解压所有压缩包（zip / tar.gz）
+          find . -type f -name "*.zip" -exec unzip -o {} \; >/dev/null 2>&1 || true
+          find . -type f -name "*.tar.gz" -exec tar -zxvf {} \; >/dev/null 2>&1 || true
 
-          # 3) PassWall2
-          download_latest_apk "Openwrt-Passwall/openwrt-passwall2"
+          echo "=========================================="
+          echo "=== 开始严格筛选适用于 ARM64 (aarch64/all) 的 APK 包 ==="
+          echo "=========================================="
 
-          # 解压所有压缩包
-          find . -name "*.zip" -exec unzip -o {} \; >/dev/null 2>&1
-          find . -name "*.tar.gz" -exec tar -zxvf {} \; >/dev/null 2>&1
-
-          # 移动所有的 .apk 包到 ImageBuilder 仓库，精准排除非 64 位 ARM 架构
+          # 遍历所有解压出的 .apk，严格检查内部声明的真实架构
           find . -type f -name "*.apk" | while read -r apk_file; do
-            if echo "$apk_file" | grep -qE 'x86_64|i386|ramips|mipsel|mips|arm_fa526|arm_cortex|armv7|armv6'; then
+            # 1. 文件名过滤：排除明显的非 ARM64 架构
+            if echo "$apk_file" | grep -qiE 'x86_64|i386|i686|ramips|mipsel|mips|arm_fa526|arm_cortex|armv7|armv6|riscv64|loongarch'; then
+              echo "[排除 - 异构文件名]: $apk_file"
               continue
             fi
-            mv "$apk_file" "../$PKGS_DIR/"
+
+            # 2. 读取 APK 包内 control.tar.gz/.PKGINFO 中声明的 pkgarch/arch
+            PKG_ARCH=""
+            if tar -tf "$apk_file" 2>/dev/null | grep -q "control.tar.gz"; then
+              PKG_ARCH=$(tar -xzOf "$apk_file" control.tar.gz 2>/dev/null | tar -xzOf - .PKGINFO 2>/dev/null | grep -E '^(arch|pkgarch) =' | head -n1 | cut -d'=' -f2 | tr -d ' ')
+            fi
+
+            # 3. 架构校验与复制（仅保留目标架构，且不改变文件内容）
+            if [ -n "$PKG_ARCH" ]; then
+              case "$PKG_ARCH" in
+                aarch64*|arm64*|all|noarch)
+                  echo "[保留 - 匹配架构 $PKG_ARCH]: $apk_file"
+                  cp -f "$apk_file" "../$PKGS_DIR/"
+                  ;;
+                *)
+                  echo "[排除 - 不兼容架构 $PKG_ARCH]: $apk_file"
+                  ;;
+              esac
+            else
+              # 无法解析 .PKGINFO 时的二次兜底判断
+              if echo "$apk_file" | grep -qiE 'aarch64|arm64|all'; then
+                echo "[保留 - 文件名标记]: $apk_file"
+                cp -f "$apk_file" "../$PKGS_DIR/"
+              else
+                echo "[排除 - 无法确认架构]: $apk_file"
+              fi
+            fi
           done
 
           cd ..
           rm -rf dl_temp
 
-      # 5. 标准重构 APK 容器中的 control.tar.gz，修补 .PKGINFO 架构属性
-      - name: Patch APK Architectures & System Configuration
+      # 5. 配置 ImageBuilder 兼容架构列表
+      - name: Configure APK Architectures & Verify Packages
         run: |
-          # 1. 扩充 ImageBuilder 的 APK 兼容架构列表
+          # 显式告知 ImageBuilder 的 apk 包管理器允许安装的主机与通用架构
           mkdir -p builder/etc/apk
-          echo "aarch64_generic" > builder/etc/apk/arch
-          echo "aarch64_cortex-a72" >> builder/etc/apk/arch
-          echo "aarch64_cortex-a53" >> builder/etc/apk/arch
-          echo "all" >> builder/etc/apk/arch
-
-          # 2. 解包修改 control.tar.gz 内的 .PKGINFO 架构标识为 aarch64_generic
-          cd builder/packages
-          for apk in *.apk; do
-            [ -f "$apk" ] || continue
-            mkdir -p tmp_apk_dir
-            if tar -xf "$apk" -C tmp_apk_dir 2>/dev/null; then
-              if [ -f tmp_apk_dir/control.tar.gz ]; then
-                mkdir -p tmp_apk_dir/ctrl
-                tar -zxf tmp_apk_dir/control.tar.gz -C tmp_apk_dir/ctrl 2>/dev/null
-                if [ -f tmp_apk_dir/ctrl/.PKGINFO ]; then
-                  sed -i -E 's/arch = .*/arch = aarch64_generic/g' tmp_apk_dir/ctrl/.PKGINFO
-                  (cd tmp_apk_dir/ctrl && tar -czf ../control.tar.gz ./* .PKGINFO 2>/dev/null)
-                  (cd tmp_apk_dir && tar -cf "../$apk" control.tar.gz data.tar.gz 2>/dev/null)
-                fi
-              fi
-            fi
-            rm -rf tmp_apk_dir
-          done
-          cd ../..
+          cat << 'EOF' > builder/etc/apk/arch
+          aarch64_generic
+          aarch64_cortex-a53
+          aarch64_cortex-a72
+          aarch64
+          all
+          EOF
 
           echo "=========================================="
-          echo "准备打入固件的第三方软件包列表："
-          ls -lh builder/packages/*.apk || echo "未找到任何 APK 文件！"
+          echo "已成功放入 ImageBuilder 仓库的第三方 APK 列表："
+          ls -lh builder/packages/*.apk || echo "警告：未找到任何 APK 文件！"
           echo "=========================================="
 
       # 6. 生成基础配置文件 (系统时区与 KMS 默认配置)
@@ -214,7 +224,7 @@ jobs:
           - **底层依赖**: nftables、kmod-nft-tproxy、kmod-tun、xray-core、sing-box、curl、wget-ssl、yq
           EOF
 
-      # 8. 打包 RootFS 并清理多余的 targz 镜像
+      # 8. 打包 RootFS 并自动删除多余的重复镜像
       - name: Build RootFS
         run: |
           cd builder
@@ -234,7 +244,7 @@ jobs:
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-          # 删除多余的 targz-rootfs.tar.gz 镜像，仅保留标准的 generic-rootfs.tar.gz
+          # 清理 redundant 的 targz-rootfs，只保留最标准的 generic-rootfs
           rm -f bin/targets/armsr/armv8/*targz*.tar.gz
 
       # 9. 上传仅包含 generic-rootfs.tar.gz 的产物到 Artifacts
