@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Full Proxy Suite)
 
 on:
   workflow_dispatch:
@@ -59,13 +59,13 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (保留所有 ARM64 核心与依赖包)
-      - name: Download & Integrate Offline Packages
+      # 4. 获取第三方离线包并直接注入 ImageBuilder 软件包仓库
+      - name: Download Third-Party Packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          OFFLINE_DIR="builder/files/root/offline_pkgs"
-          mkdir -p "$OFFLINE_DIR"
+          PKGS_DIR="builder/packages"
+          mkdir -p "$PKGS_DIR"
           mkdir -p dl_temp
           cd dl_temp
 
@@ -74,7 +74,7 @@ jobs:
             echo "==> 正在获取 $repo 的最新 Release 包..."
             local rel_json=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/releases/latest")
             
-            # 提取下载链接，排除非 ARM64 架构（如 x86, ramips 等）
+            # 提取适合 ARM64 的包
             local urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' | grep -vE '(x86_64|ramips|mipsel|i386|armv7)' || true)
 
             for url in $urls; do
@@ -96,24 +96,48 @@ jobs:
           find . -name "*.zip" -exec unzip -o {} \;
           find . -name "*.tar.gz" -exec tar -zxvf {} \;
 
-          # 收集所有 aarch64 / all 架构的 .apk 文件
+          # 移动所有的 .apk 包到 ImageBuilder 的 packages 目录
           find . -type f -name "*.apk" | while read -r apk_file; do
             if echo "$apk_file" | grep -qE 'x86_64|ramips|mipsel|i386|armv7'; then
               continue
             fi
-            mv "$apk_file" "../$OFFLINE_DIR/"
+            mv "$apk_file" "../$PKGS_DIR/"
           done
 
           cd ..
           rm -rf dl_temp
 
+      # 5. 修正第三方 APK 架构限制，防止 ImageBuilder 报 uninstallable 错误
+      - name: Patch APK Architectures & System Configuration
+        run: |
+          # 1. 扩充 ImageBuilder 的 APK 兼容架构配置
+          mkdir -p builder/etc/apk
+          echo "aarch64_generic" >> builder/etc/apk/arch
+          echo "aarch64_cortex-a72" >> builder/etc/apk/arch
+          echo "aarch64_cortex-a53" >> builder/etc/apk/arch
+
+          # 2. 解包修正 packages 目录下所有 .apk 的 .PKGINFO 架构标识
+          cd builder/packages
+          for apk in *.apk; do
+            [ -f "$apk" ] || continue
+            mkdir -p tmp_apk
+            tar -xf "$apk" -C tmp_apk 2>/dev/null || continue
+            if [ -f tmp_apk/.PKGINFO ]; then
+              # 将具体的 cortex-a72 等架构统一修改为通用 aarch64_generic
+              sed -i -E 's/arch = .*/arch = aarch64_generic/g' tmp_apk/.PKGINFO
+              (cd tmp_apk && tar -zcf "../$apk" ./* .PKGINFO 2>/dev/null)
+            fi
+            rm -rf tmp_apk
+          done
+          cd ../..
+
           echo "=========================================="
-          echo "预置到 /root/offline_pkgs 的第三方离线包清单："
-          ls -lh "$OFFLINE_DIR"/*.apk || echo "未找到任何 APK 文件！"
+          echo "准备打入固件的第三方软件包列表："
+          ls -lh builder/packages/*.apk || echo "未找到任何 APK 文件！"
           echo "=========================================="
 
-      # 5. 生成自定义系统配置 (开机带强行安装与日志输出)
-      - name: Inject Custom Configuration
+      # 6. 生成基础配置文件 (系统时区与 KMS 默认配置)
+      - name: Inject Custom UCI Default Settings
         run: |
           FILES_DIR="builder/files/etc/uci-defaults"
           mkdir -p "$FILES_DIR"
@@ -121,45 +145,20 @@ jobs:
           cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
           #!/bin/sh
 
-          LOG_FILE="/var/log/offline_install.log"
-          echo "=== 开机第一阶段自动配置启动 ===" > "$LOG_FILE"
-
           # 1. 配置系统语言与时区
           uci set system.@system[0].timezone='CST-8'
           uci set system.@system[0].zonename='Asia/Shanghai'
           uci commit system
 
-          # 2. 启用 vlmcsd (KMS 服务)
+          # 2. 默认开启 VLMCSD (KMS)
           if [ -f /etc/config/vlmcsd ]; then
             uci set vlmcsd.config.enabled='1'
             uci commit vlmcsd
           fi
 
-          # 3. 首次开机离线安装第三方包 (使用 --force-arch 强行解决微架构差异)
-          if ls /root/offline_pkgs/*.apk >/dev/null 2>&1; then
-            echo "发现第三方离线包，开始强制安装..." >> "$LOG_FILE"
-            
-            # --allow-untrusted: 跳过签名验证
-            # --force-arch: 忽略 aarch64_cortex-a72 与 aarch64_generic 的架构冲突
-            apk add --allow-untrusted --force-arch /root/offline_pkgs/*.apk >> "$LOG_FILE" 2>&1
-            INSTALL_STATUS=$?
-
-            if [ $INSTALL_STATUS -eq 0 ]; then
-              echo "所有第三方软件包安装成功，清理安装包缓存..." >> "$LOG_FILE"
-              rm -rf /root/offline_pkgs
-            else
-              echo "警告: 部分或全部软件包安装失败，错误码 $INSTALL_STATUS。详细日志见上。暂存包已保留在 /root/offline_pkgs 供排查。" >> "$LOG_FILE"
-            fi
-          else
-            echo "未找到 /root/offline_pkgs 目录或该目录下无安装包。" >> "$LOG_FILE"
-          fi
-
-          # 4. 尝试启用并启动相关服务
+          # 3. 确保各个服务开机自启
           for svc in vlmcsd nikki mosdns passwall2; do
-            if [ -f "/etc/init.d/$svc" ]; then
-              /etc/init.d/$svc enable >> "$LOG_FILE" 2>&1
-              /etc/init.d/$svc restart >> "$LOG_FILE" 2>&1
-            fi
+            [ -f "/etc/init.d/$svc" ] && /etc/init.d/$svc enable
           done
 
           exit 0
@@ -167,20 +166,18 @@ jobs:
 
           chmod +x "$FILES_DIR/99-custom-init.sh"
 
-      # 6. 提取主要组件与内核版本号
+      # 7. 提取软件版本信息
       - name: Collect Software Versions
         run: |
-          # 1. 提取内核版本号
           KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
 
-          # 2. 提取离线包版本号
           GET_VER() {
             local pattern=$1
-            local file=$(ls builder/files/root/offline_pkgs/${pattern}*.apk 2>/dev/null | head -n1)
+            local file=$(ls builder/packages/${pattern}*.apk 2>/dev/null | head -n1)
             if [ -n "$file" ]; then
               basename "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64.*\.apk$|_all\.apk$|\.apk$//'
             else
-              echo "最新发布版"
+              echo "已打入最新版"
             fi
           }
 
@@ -189,15 +186,11 @@ jobs:
           MOSDNS_VER=$(GET_VER "mosdns")
           PASSWALL2_VER=$(GET_VER "luci-app-passwall2")
 
-          # 3. 获取北京时间 (UTC+8)
           BUILD_DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
-
-          # 4. 写入环境变量
           echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
 
-          # 写入 Release Body 说明文件
           cat <<EOF > $GITHUB_WORKSPACE/release_body.md
-          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版构建
+          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 完整代理集成版
 
           - **构建日期**: $BUILD_DATE
           - **构建 ID**: ${{ github.run_id }}
@@ -210,46 +203,49 @@ jobs:
           - **MosDNS**: \`$MOSDNS_VER\`
           - **PassWall2**: \`$PASSWALL2_VER\`
 
-          ### 🛠 集成软件列表
-          - **代理与 DNS**: PassWall2, Nikki, MosDNS
-          - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
-          - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-tun、curl、wget-ssl、yq
+          ### 🛠 已编译打入固件的软件列表
+          - **科学上网/代理 Suite**: PassWall2、Nikki、MosDNS
+          - **网络与系统服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
+          - **底层依赖**: nftables、kmod-nft-tproxy、kmod-tun、xray-core、sing-box、curl、wget-ssl、yq
           EOF
 
-      # 7. 打包 RootFS
+      # 8. 直接将所有软件打包进固件 RootFS
       - name: Build RootFS
         run: |
           cd builder
 
-          # 打包系统核心与所有代理组件所需的运行依赖库
+          # 在 PACKAGES 中包含所有核心包、第三方应用以及 PassWall2
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
+            nikki luci-app-nikki luci-i18n-nikki-zh-cn \
+            mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
+            luci-app-passwall2 luci-i18n-passwall2-zh-cn \
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq \
             xray-core sing-box tcping unzip resolveip luci-compat"
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传 RootFS 编译产物到 Artifacts
+      # 9. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-armsr-rootfs-optimize-${{ env.BUILD_DATE }}
+          name: immortalwrt-25.12.1-armsr-full-suite-${{ env.BUILD_DATE }}
           path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 9. 发布编译产物到 GitHub Releases
+      # 10. 发布编译产物到 GitHub Releases
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
         with:
           tag_name: ImmortalWrt-25.12.1-${{ env.BUILD_DATE }}-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 ARMSR RootFS Optimize (${{ env.BUILD_DATE }})
+          name: ImmortalWrt 25.12.1 ARMSR Full Suite (${{ env.BUILD_DATE }})
           body_path: release_body.md
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
