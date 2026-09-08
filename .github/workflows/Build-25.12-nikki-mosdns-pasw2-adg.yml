@@ -59,7 +59,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall2 统一放入 offline_pkgs 避坑)
+      # 4. 获取并集成第三方离线包 (保留所有 ARM64 核心与依赖包)
       - name: Download & Integrate Offline Packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,12 +74,8 @@ jobs:
             echo "==> 正在获取 $repo 的最新 Release 包..."
             local rel_json=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$repo/releases/latest")
             
-            # 过滤出适合 aarch64_generic / all 的包，剔除 Specific CPU 微架构 (如 cortex-a72, rk3399 等)
-            local urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' | grep -vE '(cortex|rk3|x86_64|ramips|mipsel)' || true)
-            
-            if [ -z "$urls" ]; then
-              urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' || true)
-            fi
+            # 提取下载链接，排除非 ARM64 架构（如 x86, ramips 等）
+            local urls=$(echo "$rel_json" | jq -r '.assets[]? | .browser_download_url // empty' | grep -E '\.(apk|zip|tar\.gz)$' | grep -vE '(x86_64|ramips|mipsel|i386|armv7)' || true)
 
             for url in $urls; do
               echo "正在下载: $url"
@@ -96,14 +92,13 @@ jobs:
           # 3) PassWall2
           download_latest_apk "Openwrt-Passwall/openwrt-passwall2"
 
-          # 解压压缩包
+          # 解压所有压缩包
           find . -name "*.zip" -exec unzip -o {} \;
           find . -name "*.tar.gz" -exec tar -zxvf {} \;
 
-          # 移动 APK 到离线安装目录，并过滤不匹配的 CPU 架构包
+          # 收集所有 aarch64 / all 架构的 .apk 文件
           find . -type f -name "*.apk" | while read -r apk_file; do
-            if echo "$apk_file" | grep -qE 'cortex-a72|cortex-a53|x86_64|ramips'; then
-              echo "跳过不兼容的微架构包: $apk_file"
+            if echo "$apk_file" | grep -qE 'x86_64|ramips|mipsel|i386|armv7'; then
               continue
             fi
             mv "$apk_file" "../$OFFLINE_DIR/"
@@ -117,7 +112,7 @@ jobs:
           ls -lh "$OFFLINE_DIR"/*.apk || echo "未找到任何 APK 文件！"
           echo "=========================================="
 
-      # 5. 生成自定义系统配置 (注入 apk add --allow-untrusted 批量安装逻辑)
+      # 5. 生成自定义系统配置 (开机带强行安装与日志输出)
       - name: Inject Custom Configuration
         run: |
           FILES_DIR="builder/files/etc/uci-defaults"
@@ -126,7 +121,10 @@ jobs:
           cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
           #!/bin/sh
 
-          # 1. 配置语言与时区
+          LOG_FILE="/var/log/offline_install.log"
+          echo "=== 开机第一阶段自动配置启动 ===" > "$LOG_FILE"
+
+          # 1. 配置系统语言与时区
           uci set system.@system[0].timezone='CST-8'
           uci set system.@system[0].zonename='Asia/Shanghai'
           uci commit system
@@ -137,18 +135,32 @@ jobs:
             uci commit vlmcsd
           fi
 
-          # 3. 首次开机离线安装第三方包 (跳过签名验证，解决架构与签名限制)
+          # 3. 首次开机离线安装第三方包 (使用 --force-arch 强行解决微架构差异)
           if ls /root/offline_pkgs/*.apk >/dev/null 2>&1; then
-            echo "正在离线安装第三方软件包 (Nikki / MosDNS / PassWall2)..." > /dev/console
-            apk add --allow-untrusted /root/offline_pkgs/*.apk
-            rm -rf /root/offline_pkgs
+            echo "发现第三方离线包，开始强制安装..." >> "$LOG_FILE"
+            
+            # --allow-untrusted: 跳过签名验证
+            # --force-arch: 忽略 aarch64_cortex-a72 与 aarch64_generic 的架构冲突
+            apk add --allow-untrusted --force-arch /root/offline_pkgs/*.apk >> "$LOG_FILE" 2>&1
+            INSTALL_STATUS=$?
+
+            if [ $INSTALL_STATUS -eq 0 ]; then
+              echo "所有第三方软件包安装成功，清理安装包缓存..." >> "$LOG_FILE"
+              rm -rf /root/offline_pkgs
+            else
+              echo "警告: 部分或全部软件包安装失败，错误码 $INSTALL_STATUS。详细日志见上。暂存包已保留在 /root/offline_pkgs 供排查。" >> "$LOG_FILE"
+            fi
+          else
+            echo "未找到 /root/offline_pkgs 目录或该目录下无安装包。" >> "$LOG_FILE"
           fi
 
-          # 4. 启用服务自启（软链接方式兜底）
-          [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
-          [ -f /etc/init.d/nikki ] && /etc/init.d/nikki enable
-          [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns enable
-          [ -f /etc/init.d/passwall2 ] && /etc/init.d/passwall2 enable
+          # 4. 尝试启用并启动相关服务
+          for svc in vlmcsd nikki mosdns passwall2; do
+            if [ -f "/etc/init.d/$svc" ]; then
+              /etc/init.d/$svc enable >> "$LOG_FILE" 2>&1
+              /etc/init.d/$svc restart >> "$LOG_FILE" 2>&1
+            fi
+          done
 
           exit 0
           EOF
