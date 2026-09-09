@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Nftables + Proxy Core)
+name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
 
 on:
   workflow_dispatch:
@@ -31,8 +31,7 @@ jobs:
           TARGET_DIR="https://downloads.immortalwrt.org/releases/25.12.1/targets/armsr/armv8/"
           echo "Connecting to target repository: ${TARGET_DIR}"
 
-          # 增加 curl 稳定性参数
-          IB_FILE=$(curl --retry 5 -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
+          IB_FILE=$(curl -sL "$TARGET_DIR" | grep -oE 'immortalwrt-imagebuilder-[^"]+\.tar\.(zst|xz)' | head -n 1)
 
           if [ -z "$IB_FILE" ]; then
             echo "::error::未能在 25.12.1/armsr/armv8 找到 ImageBuilder 下载包！"
@@ -42,7 +41,7 @@ jobs:
           DOWNLOAD_URL="${TARGET_DIR}${IB_FILE}"
           echo "Downloading ImageBuilder from: ${DOWNLOAD_URL}"
 
-          curl --retry 5 -sL "$DOWNLOAD_URL" -o ib_package.archive
+          curl -sL "$DOWNLOAD_URL" -o ib_package.archive
           mkdir -p builder
 
           if [[ "$IB_FILE" == *.zst ]]; then
@@ -52,46 +51,64 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (精确提取 25.12 及增加重试机制)
+      # 4. 获取并集成第三方离线包 (加入重试容错机制)
       - name: Download & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
           cd builder/packages
 
-          CURL_OPT="--retry 5 --retry-connrefused --retry-delay 2 -sSL"
+          # 定义带有重试机制的下载函数 (最大尝试 3 次)
+          download_with_retry() {
+            local url=$1
+            local max_attempts=3
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              echo "正在下载 (尝试 $attempt/$max_attempts): $url"
+              if curl -sSL -O "$url"; then
+                echo "下载成功: $url"
+                return 0
+              else
+                echo "下载失败，等待 3 秒后重试..."
+                sleep 3
+                attempt=$((attempt + 1))
+              fi
+            done
+            echo "::error::下载失败超过最大次数: $url"
+            return 1
+          }
 
-          # 1) Nikki (精准过滤，只保留 25.12 和 all 的 apk/tar.gz，抛弃 24.10)
-          echo "==> 正在获取 Nikki..."
-          NK_JSON=$(curl $CURL_OPT "https://api.github.com/repos/nikkinikki-org/OpenWrt-nikki/releases/latest")
-          NK_URLS=$(echo "$NK_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(25\.12\.tar\.gz|all\.apk)')
-          for url in $NK_URLS; do
-            echo "下载: $url"
-            curl $CURL_OPT -O "$url"
-          done
+          download_latest_assets() {
+            local repo=$1
+            local filter_regex=$2
+            echo "==> 正在获取 $repo 的最新 Releases..."
+            local rel_json=$(curl -sL "https://api.github.com/repos/$repo/releases/latest")
+            local urls=$(echo "$rel_json" | jq -r '.assets[].browser_download_url // empty' | grep -E "$filter_regex" || true)
+            
+            for url in $urls; do
+              download_with_retry "$url"
+            done
+          }
+
+          # 1) Nikki - 精准匹配 25.12 的 aarch64 包或通用的 apk/ipk，过滤掉 23.05 和 24.10
+          download_latest_assets "nikkinikki-org/OpenWrt-nikki" '(aarch64.*25\.12|all|\.apk|\.ipk)'
 
           # 2) MosDNS
-          echo "==> 正在获取 MosDNS..."
-          MD_JSON=$(curl $CURL_OPT "https://api.github.com/repos/sbwml/luci-app-mosdns/releases/latest")
-          MD_URLS=$(echo "$MD_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -E '(aarch64|all)\.apk')
-          for url in $MD_URLS; do
-            echo "下载: $url"
-            curl $CURL_OPT -O "$url"
-          done
+          download_latest_assets "sbwml/luci-app-mosdns" '(aarch64|arm64|all|\.apk|\.ipk)'
 
-          # 3) PassWall2
-          echo "==> 正在获取 PassWall2..."
-          PW_JSON=$(curl $CURL_OPT "https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest" || echo "")
+          # 3) PassWall2 (精准匹配主程序及 aarch64 依赖包)
+          echo "==> 正在获取 Openwrt-Passwall/openwrt-passwall2 的最新 Releases..."
+          PW_JSON=$(curl -sL "https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest" || echo "")
           PW_URLS=$(echo "$PW_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -iE '(luci-app-passwall2.*\.apk|luci-i18n-passwall2-zh-cn.*\.apk|passwall_packages_apk_aarch64_generic\.zip)' || true)
+
           if [ -n "$PW_URLS" ]; then
             for url in $PW_URLS; do
-              echo "下载: $url"
-              curl $CURL_OPT -O "$url"
+              download_with_retry "$url"
             done
           else
-            echo "API获取失败，使用兜底下载链接..."
-            curl $CURL_OPT -O "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-app-passwall2-25.12.25-r1.apk"
-            curl $CURL_OPT -O "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-i18n-passwall2-zh-cn-25.12.25.apk"
-            curl $CURL_OPT -O "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/passwall_packages_apk_aarch64_generic.zip"
+            echo "未匹配到 PassWall2 最新版，采用指定兜底版本..."
+            download_with_retry "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-app-passwall2-25.12.25-r1.apk"
+            download_with_retry "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-i18n-passwall2-zh-cn-25.12.25.apk"
+            download_with_retry "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/passwall_packages_apk_aarch64_generic.zip"
           fi
 
           # 解压软件包
@@ -108,13 +125,15 @@ jobs:
           # 提升子目录 apk 到根目录
           find . -mindepth 2 -name "*.apk" -exec mv {} . \;
 
-          # 清理有冲突或无用的旧组件
+          # 排坑 1：彻底消灭依赖树冲突 (解决 Error 7)
+          echo "==> 正在剔除冲突的核心组件 (mihomo-alpha)..."
           rm -f mihomo-alpha*.apk 2>/dev/null || true
 
-          # 注入允许未签名包的参数
+          # 排坑 2：贯彻落实 --allow-untrusted (解决 UNTRUSTED signature 警告)
+          echo "==> 注入 --allow-untrusted 以信任所有第三方离线包..."
           sed -i 's/--no-network/--no-network --allow-untrusted/g' ../Makefile 2>/dev/null || true
 
-          # 提取离线包名称列表
+          # 提取稳定的离线包名称列表
           OFFLINE_PKGS=""
           for apk in *.apk; do
             pkgname=$(tar -Ozxf "$apk" .PKGINFO 2>/dev/null | grep "^pkgname = " | cut -d' ' -f3 | tr -d '\r' || true)
@@ -125,6 +144,7 @@ jobs:
           done
           
           OFFLINE_PKGS=$(echo "$OFFLINE_PKGS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          echo "解析出的离线包清单: $OFFLINE_PKGS"
           echo "OFFLINE_PKGS=$OFFLINE_PKGS" >> $GITHUB_ENV
 
       # 5. 生成自定义系统配置
@@ -136,19 +156,19 @@ jobs:
           cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
           #!/bin/sh
           
-          # 系统时间设置
+          # 1. 基础系统设置
           uci set system.@system[0].timezone='CST-8'
           uci set system.@system[0].zonename='Asia/Shanghai'
           uci commit system
 
-          # 激活 KMS
+          # 2. 启用 vlmcsd (KMS 服务)
           if [ -f /etc/config/vlmcsd ]; then
             uci set vlmcsd.config.enabled='1'
             uci commit vlmcsd
           fi
           [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
 
-          # 避免网络冲突，默认关闭自启
+          # 避免网络组件冲突，默认关闭自启，需要时由用户进界面开启
           [ -f /etc/init.d/nikki ] && /etc/init.d/nikki disable
           [ -f /etc/init.d/passwall ] && /etc/init.d/passwall disable
           [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns disable
@@ -157,30 +177,55 @@ jobs:
           EOF
           chmod +x "$FILES_DIR/99-custom-init.sh"
 
-      # 6. 生成版本说明
-      - name: Generate Release Body
+      # 6. 提取主要组件与内核版本号
+      - name: Collect Software Versions
         run: |
+          KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
+          cd builder/packages
+          
+          GET_VER() {
+            local file=$(ls $1*.apk 2>/dev/null | head -n1)
+            if [ -n "$file" ]; then
+              echo "$file" | sed -E 's/^[^-_]+[-_]//; s/_aarch64\.apk$|_all\.apk$|\.apk$//'
+            else
+              echo "最新发布版"
+            fi
+          }
+
+          NIKKI_VER=$(GET_VER "nikki")
+          LUCI_NIKKI_VER=$(GET_VER "luci-app-nikki")
+          MOSDNS_VER=$(GET_VER "mosdns")
+          PASSWALL2_VER=$(GET_VER "luci-app-passwall2")
           BUILD_DATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
           echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
-          
+
           cat <<EOF > $GITHUB_WORKSPACE/release_body.md
-          ## ImmortalWrt 25.12.1 (ARMSR / Pure Nftables) 构建
+          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 优化版构建
           - **构建日期**: $BUILD_DATE
-          - **核心环境**: 已完全剔除 iptables 组件，**纯净 nftables 环境** (依赖 kmod-nft 族)。
-          - **代理引擎**: 底层已强制包含 \`xray-core\` 和 \`sing-box\`，完美适配 PassWall VLESS 节点。
-          - **集成插件**: Nikki, MosDNS, PassWall2, SoftEtherVPN
+          - **构建 ID**: ${{ github.run_id }}
+          - **架构 / 包管理器**: ARMSR (ARM64) / APK
+          ### 📦 核心组件版本清单
+          - **Linux Kernel**: \`$KERNEL_VER\`
+          - **Nikki Core**: \`$NIKKI_VER\`
+          - **LuCI App Nikki**: \`$LUCI_NIKKI_VER\`
+          - **MosDNS**: \`$MOSDNS_VER\`
+          - **PassWall2**: \`$PASSWALL2_VER\`
+          ### 🛠 集成软件及特性列表
+          - **纯 NFT 环境**: 完全剔除 iptables，原生使用 fw4/nftables，并补齐劫持模块。
+          - **完整核心支持**: 已内置 \`xray-core\`, \`sing-box\`, \`hysteria\`, \`tuic\` 等全家桶。
+          - **容错下载**: 第三方包下载采用防中断 3 次重试机制。
+          - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
           EOF
 
-      # 7. 打包 RootFS (强化网络环境与代理核心)
+      # 7. 打包 RootFS
       - name: Build RootFS
         run: |
           cd builder
           
           # =========================================================
-          # 核心改动：
-          # 1. -iptables* 剔除所有 iptables 相关兼容层，纯净使用 nftables
-          # 2. 补全 kmod-nft-tproxy, kmod-nft-socket 等 Nftables 劫持模块
-          # 3. 加入 xray-core 和 sing-box 以支持 PassWall 运行 VLESS
+          # [修改重点] 纯 NFTables 环境配置 + 补齐代理核心全家桶
+          # 1. 明确抛弃旧版 iptables，引入 kmod-nft-* 系列流量劫持模块
+          # 2. 从官方软件源拉取各类代理核心，提供最大的兼容性
           # =========================================================
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
@@ -189,31 +234,31 @@ jobs:
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates unzip \
-            nftables kmod-nft-core kmod-nft-nat kmod-nft-tproxy kmod-nft-socket kmod-nft-fib kmod-tun kmod-dummy yq \
-            -iptables -iptables-nft -iptables-legacy -ip6tables -ip6tables-nft -ip6tables-legacy \
+            nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-nft-offload kmod-tun kmod-dummy yq \
+            -iptables -iptables-nft -ip6tables -ip6tables-nft -iptables-mod-tproxy -iptables-mod-extra \
             -dnsmasq dnsmasq-full \
             -ip-tiny ip-full \
-            xray-core sing-box \
+            xray-core sing-box hysteria tuic-client shadowsocks-rust-sslocal v2ray-plugin xray-plugin \
             ${{ env.OFFLINE_PKGS }}"
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
-      # 8. 上传产物到 Artifacts
+      # 8. 上传 RootFS 编译产物到 Artifacts
       - name: Upload RootFS Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-25.12.1-armsr-nft-proxy-${{ env.BUILD_DATE }}
+          name: immortalwrt-25.12.1-armsr-rootfs-optimize-${{ env.BUILD_DATE }}
           path: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-      # 9. 发布至 GitHub Releases
+      # 9. 发布编译产物到 GitHub Releases
       - name: Upload RootFS to GitHub Release
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
         with:
           tag_name: ImmortalWrt-25.12.1-${{ env.BUILD_DATE }}-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 ARMSR RootFS Nftables (${{ env.BUILD_DATE }})
+          name: ImmortalWrt 25.12.1 ARMSR RootFS Optimize (${{ env.BUILD_DATE }})
           body_path: release_body.md
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
