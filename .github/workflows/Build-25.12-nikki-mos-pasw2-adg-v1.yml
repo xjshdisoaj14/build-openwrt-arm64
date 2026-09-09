@@ -89,7 +89,7 @@ jobs:
             done
           }
 
-          # 1) Nikki - 精准匹配 25.12 的 aarch64 包或通用的 apk/ipk，过滤掉 23.05 和 24.10
+          # 1) Nikki - 精准匹配 25.12 的 aarch64 包或通用包
           download_latest_assets "nikkinikki-org/OpenWrt-nikki" '(aarch64.*25\.12|all|\.apk|\.ipk)'
 
           # 2) MosDNS
@@ -107,7 +107,7 @@ jobs:
           else
             echo "未匹配到 PassWall2 最新版，采用指定兜底版本..."
             download_with_retry "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-app-passwall2-25.12.25-r1.apk"
-            download_with_retry "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-i18n-passwall2-zh-cn-25.12.25.apk"
+            download_with_retry "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-i18n-passwall2-zh-cn-25.12.25-1.apk"
             download_with_retry "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/passwall_packages_apk_aarch64_generic.zip"
           fi
 
@@ -212,7 +212,7 @@ jobs:
           - **PassWall2**: \`$PASSWALL2_VER\`
           ### 🛠 集成软件及特性列表
           - **纯 NFT 环境**: 完全剔除 iptables，原生使用 fw4/nftables，并补齐劫持模块。
-          - **完整核心支持**: 已内置 \`xray-core\`, \`sing-box\`, \`hysteria\`, \`tuic\` 等全家桶。
+          - **完整核心支持**: 已内置 \`xray-core\`, \`sing-box\`, \`hysteria\` 等主流核心。
           - **容错下载**: 第三方包下载采用防中断 3 次重试机制。
           - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
           EOF
@@ -223,9 +223,7 @@ jobs:
           cd builder
           
           # =========================================================
-          # [修改重点] 纯 NFTables 环境配置 + 补齐代理核心全家桶
-          # 1. 明确抛弃旧版 iptables，引入 kmod-nft-* 系列流量劫持模块
-          # 2. 从官方软件源拉取各类代理核心，提供最大的兼容性
+          # [优化说明] 移除官方源中不存在的 tuic-client，保留 xray-core 和 hysteria 等核心
           # =========================================================
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
@@ -238,7 +236,7 @@ jobs:
             -iptables -iptables-nft -ip6tables -ip6tables-nft -iptables-mod-tproxy -iptables-mod-extra \
             -dnsmasq dnsmasq-full \
             -ip-tiny ip-full \
-            xray-core sing-box hysteria tuic-client shadowsocks-rust-sslocal v2ray-plugin xray-plugin \
+            xray-core sing-box hysteria shadowsocks-rust-sslocal v2ray-plugin xray-plugin \
             ${{ env.OFFLINE_PKGS }}"
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
