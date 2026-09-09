@@ -114,12 +114,11 @@ jobs:
           echo "==> 注入 --allow-untrusted 以信任所有第三方离线包..."
           sed -i 's/--no-network/--no-network --allow-untrusted/g' ../Makefile 2>/dev/null || true
 
-          # 提取稳定的离线包名称列表，增强截取逻辑防止包名解析错乱
+          # 提取稳定的离线包名称列表
           OFFLINE_PKGS=""
           for apk in *.apk; do
             pkgname=$(tar -Ozxf "$apk" .PKGINFO 2>/dev/null | grep "^pkgname = " | cut -d' ' -f3 | tr -d '\r' || true)
             if [ -z "$pkgname" ]; then
-              # 若解析失败，通过更严格的正则是安全剥离版本号 (例如：xray-core-1.8.4-1-aarch64.apk -> xray-core)
               pkgname=$(echo "$apk" | sed -E 's/_[0-9].*\.apk$//; s/-[0-9].*\.apk$//')
             fi
             OFFLINE_PKGS="$OFFLINE_PKGS $pkgname"
@@ -135,7 +134,6 @@ jobs:
           FILES_DIR="builder/files/etc/uci-defaults"
           mkdir -p "$FILES_DIR"
 
-          # 优化后的初始化脚本
           cat << 'EOF' > "$FILES_DIR/99-custom-init.sh"
           #!/bin/sh
           
@@ -151,11 +149,7 @@ jobs:
           fi
           [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
 
-          # =========================================================
-          # 避坑指北：绝对不能同时 enable Nikki 和 PassWall2 
-          # 开机时它们会同时抢占 DNS (53) 和 TProxy 端口导致双双瘫痪。
-          # 改进：默认安装好，由用户在 LuCI 界面明确选择启用哪个！
-          # =========================================================
+          # 避免网络组件冲突，默认关闭自启，需要时由用户进界面开启
           [ -f /etc/init.d/nikki ] && /etc/init.d/nikki disable
           [ -f /etc/init.d/passwall ] && /etc/init.d/passwall disable
           [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns disable
@@ -198,10 +192,9 @@ jobs:
           - **MosDNS**: \`$MOSDNS_VER\`
           - **PassWall2**: \`$PASSWALL2_VER\`
           ### 🛠 集成软件列表
-          - **核心环境修复**: 已自动替换 \`dnsmasq-full\` 与 \`ip-full\`，保障透明代理可用性。
+          - **核心环境修复**: 已替换满血环境并注入 \`xray-core\` 和 \`sing-box\` 保障 VLESS 运行。
           - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall2
           - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
-          - **网络增强工具**: nftables、iptables-nft、kmod-nft-tproxy、kmod-tun、curl、wget-ssl、yq
           EOF
 
       # 7. 打包 RootFS
@@ -210,10 +203,9 @@ jobs:
           cd builder
           
           # =========================================================
-          # 核心修复区：解决编译成功但插件用不了的 BUG
-          # 1. 增加 `-dnsmasq dnsmasq-full` 强制剔除阉割版，装满血版，否则 PW2 分流崩溃
-          # 2. 增加 `-ip-tiny ip-full` 获取完整的策略路由支持
-          # 3. 增加 `iptables-nft` 作为底层规则的兼容桥梁
+          # 核心修复区：显式声明 xray-core 和 sing-box
+          # 只有写进这个列表里，ImageBuilder 才会去官方源拉取这两大引擎
+          # 从而彻底解决 Passwall 报“未适配到 VLESS 核心”的错误
           # =========================================================
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
@@ -221,10 +213,11 @@ jobs:
             vsftpd openssh-sftp-server \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
-            curl wget-ssl ca-certificates \
+            curl wget-ssl ca-certificates unzip \
             nftables iptables-nft kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq \
             -dnsmasq dnsmasq-full \
             -ip-tiny ip-full \
+            xray-core sing-box \
             ${{ env.OFFLINE_PKGS }}"
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
