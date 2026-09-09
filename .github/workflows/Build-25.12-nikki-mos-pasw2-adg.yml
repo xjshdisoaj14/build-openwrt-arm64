@@ -51,7 +51,7 @@ jobs:
           fi
           rm -f ib_package.archive
 
-      # 4. 获取并集成第三方离线包 (Nikki + MosDNS)
+      # 4. 获取并集成第三方离线包 (Nikki + MosDNS + PassWall2)
       - name: Download & Integrate Offline Packages
         run: |
           mkdir -p builder/packages
@@ -75,7 +75,24 @@ jobs:
           # 2) MosDNS
           download_latest_assets "sbwml/luci-app-mosdns"
 
-          # 解压可能包含在压缩包中的软件包
+          # 3) PassWall2 (精准匹配 PassWall2 的全平台主程序及 aarch64 依赖包)
+          echo "==> 正在获取 Openwrt-Passwall/openwrt-passwall2 的最新 Releases..."
+          PW_JSON=$(curl -sL "https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest" || echo "")
+          PW_URLS=$(echo "$PW_JSON" | jq -r '.assets[].browser_download_url // empty' | grep -iE '(luci-app-passwall2.*\.apk|luci-i18n-passwall2-zh-cn.*\.apk|passwall_packages_apk_aarch64_generic\.zip)' || true)
+
+          if [ -n "$PW_URLS" ]; then
+            for url in $PW_URLS; do
+              echo "正在下载: $url"
+              curl -sSL -O "$url"
+            done
+          else
+            echo "未匹配到 PassWall2 最新版，采用指定兜底版本..."
+            curl -sSL -O "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-app-passwall2-25.12.25-r1.apk"
+            curl -sSL -O "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/luci-i18n-passwall2-zh-cn-25.12.25.apk"
+            curl -sSL -O "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/25.12.25-1/passwall_packages_apk_aarch64_generic.zip"
+          fi
+
+          # 解压可能包含在压缩包中的软件包 (完美处理 PassWall2 的依赖 zip包)
           for archive in *.zip *.tar.gz; do
             [ -e "$archive" ] || continue
             if [[ "$archive" == *.zip ]]; then
@@ -92,36 +109,23 @@ jobs:
           echo "当前集成至 ImageBuilder 本地库的离线 APK 清单："
           ls -la *.apk || echo "未找到 APK 文件！"
 
-      # 4.5 下载并集成 PassWall2 (主程序 + 中文包 + 依赖包)
-      # 【关键】PassWall2 及依赖均未用 ImmortalWrt 官方密钥签名。
-      # 若直接混入主 packages/ 目录，会让整个 packages.adb 报 UNTRUSTED，
-      # 连带已签名的 nikki/mosdns 也一并失效。
-      # 因此将 PassWall2 单独放到 packages/passwall2/ 子目录，后续作为 trusted feed 加载。
-      - name: Download & Integrate PassWall2
-        run: |
-          mkdir -p builder/packages/passwall2
-          cd builder/packages/passwall2
+          # 自动解析所有第三方 apk 的内部真实包名，并汇总为系统变量供编译系统挂载 (等效于手动 apk add *.apk)
+          OFFLINE_PKGS=""
+          for apk in *.apk; do
+            # 优先从标准的 apk (tar.gz内核) 的 .PKGINFO 中提取最精确的包名
+            pkgname=$(tar -Ozxf "$apk" .PKGINFO 2>/dev/null | grep "^pkgname = " | cut -d' ' -f3 | tr -d '\r' || true)
+            # 如果提取失败，启用正则从文件名安全剥离版本号提取
+            if [ -z "$pkgname" ]; then
+              pkgname=$(basename "$apk" | sed -E 's/-[0-9].*\.apk$//')
+            fi
+            OFFLINE_PKGS="$OFFLINE_PKGS $pkgname"
+          done
+          # 去重并写入全局环境变量
+          OFFLINE_PKGS=$(echo "$OFFLINE_PKGS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          echo "解析出的全部离线包依赖清单(传给 ImageBuilder): $OFFLINE_PKGS"
+          echo "OFFLINE_PKGS=$OFFLINE_PKGS" >> $GITHUB_ENV
 
-          # 固定版本：25.12.25-1（与 ImmortalWrt 25.12.1 / APK 体系对应）
-          PW2_VER="25.12.25-1"
-          PW2_BASE="https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/${PW2_VER}"
-
-          echo "==> 正在下载 PassWall2 ${PW2_VER} (aarch64_generic)..."
-          curl -sSL -O "${PW2_BASE}/luci-app-passwall2-${PW2_VER}-r1.apk"
-          curl -sSL -O "${PW2_BASE}/luci-i18n-passwall2-zh-cn-25.12.25.apk"
-          curl -sSL -O "${PW2_BASE}/passwall_packages_apk_aarch64_generic.zip"
-
-          # 解压依赖包（保留在 passwall2/ 子目录内，不污染主 packages/）
-          unzip -o passwall_packages_apk_aarch64_generic.zip || true
-          rm -f passwall_packages_apk_aarch64_generic.zip
-
-          # 将嵌套子目录中的 apk 提升到 passwall2/ 根目录（供 apk 直接识别）
-          find . -mindepth 2 -name "*.apk" -exec mv {} . \;
-
-          echo "==> PassWall2 APK 清单："
-          ls -la *.apk
-
-      # 5. 生成自定义系统配置 (修复 uci: command not found 问题的关键)
+      # 5. 生成自定义系统配置 (保留你的填坑神器：修复 uci 命令并处理自启动)
       - name: Inject Custom Configuration
         run: |
           # 创建 OpenWrt 文件系统预置目录
@@ -147,7 +151,7 @@ jobs:
           [ -f /etc/init.d/vlmcsd ] && /etc/init.d/vlmcsd enable
           [ -f /etc/init.d/nikki ] && /etc/init.d/nikki enable
           [ -f /etc/init.d/mosdns ] && /etc/init.d/mosdns enable
-          [ -f /etc/init.d/passwall2 ] && /etc/init.d/passwall2 enable
+          [ -f /etc/init.d/passwall ] && /etc/init.d/passwall enable
 
           exit 0
           EOF
@@ -199,7 +203,7 @@ jobs:
           - **PassWall2**: \`$PASSWALL2_VER\`
 
           ### 🛠 集成软件列表
-          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、PassWall2、MosDNS
+          - **代理与 DNS**: Nikki (内置 Mihomo 核心)、MosDNS、PassWall2 (及全依赖节点核心)
           - **VPN/网络服务**: SoftEtherVPN、VLMCSD (KMS)、VSFTPD、SFTP-Server
           - **网络增强工具**: nftables、kmod-nft-tproxy、kmod-tun、curl、wget-ssl、yq
           EOF
@@ -209,32 +213,17 @@ jobs:
         run: |
           cd builder
 
-          # 【关键】PassWall2 是未签名包，必须：
-          #   a) 将 packages/passwall2/ 作为 trusted 本地 feed 加入 repositories.conf，
-          #      这样 apk 才不会因 UNTRUSTED signature 拒绝加载整个索引；
-          #   b) 让 apk 对该目录下的包走 --allow-untrusted。
-          # 主 packages/ 目录保留给已签名的 nikki/mosdns，维持原有行为。
-          mkdir -p repo/keys
-          REPO_CONF="repositories.conf"
-          touch "$REPO_CONF"
-          grep -q "passwall2" "$REPO_CONF" || \
-            echo "src/trusted passwall2 file:packages/passwall2" >> "$REPO_CONF"
-
-          # 让 ImageBuilder 调用 apk 时自动附加 --allow-untrusted
-          export APK_OPTS="--allow-untrusted"
-
           # 包含预置 custom files (包含 uci-defaults 初始化脚本)
+          # 注意：这里的 ${{ env.OFFLINE_PKGS }} 会自动平铺展开包含 PassWall2 / Nikki / MosDNS 的主程序和所有被解压出来的节点依赖核心
           PACKAGES="luci \
             luci-i18n-base-zh-cn \
             luci-theme-argon \
             vsftpd openssh-sftp-server \
-            nikki luci-app-nikki luci-i18n-nikki-zh-cn \
-            mosdns luci-app-mosdns luci-i18n-mosdns-zh-cn \
             luci-app-vlmcsd \
             luci-i18n-softethervpn-zh-cn \
             curl wget-ssl ca-certificates \
             nftables kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-tun kmod-dummy yq \
-            luci-app-passwall2 luci-i18n-passwall2-zh-cn passwall2-core v2ray-plugin xray-core sing-box"
+            ${{ env.OFFLINE_PKGS }}"
 
           make image PROFILE="generic" PACKAGES="$PACKAGES" FILES="files" -j$(nproc)
 
