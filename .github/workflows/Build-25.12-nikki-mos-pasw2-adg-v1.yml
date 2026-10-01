@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Proxy Suite)
+name: Build ImmortalWrt 25.12.1 (All Proxy Suite)
 
 on:
   workflow_dispatch:
