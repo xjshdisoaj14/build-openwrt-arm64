@@ -207,7 +207,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/')
         with:
           tag_name: ImmortalWrt-25.12.1-${{ env.BUILD_DATE }}-${{ github.run_id }}
-          name: ImmortalWrt 25.12.1 ARMSR RootFS Optimize (${{ env.BUILD_DATE }})
+          name: ImmortalWrt25.12.1 ARMRoot Optimize (${{ env.BUILD_DATE }})
           body_path: release_body.md
           files: builder/bin/targets/armsr/armv8/*rootfs.tar.gz
         env:
