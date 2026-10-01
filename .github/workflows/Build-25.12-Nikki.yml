@@ -129,7 +129,22 @@ jobs:
       - name: Collect Software Versions
         run: |
           # 1. 提取内核版本号
-          KERNEL_VER=$(grep -i "LINUX_VERSION" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ' || echo "25.12 Standard Kernel")
+                # 1. 尝试从 build/target/linux/*/Makefile 或 include/kernel-*.mk 提取明确的版本号数字 (如 6.6.18)
+            KERNEL_VER=$(grep -E -h "LINUX_VERSION-[0-9]" builder/include/kernel-*.mk 2>/dev/null | head -n1 | cut -d'=' -f2 | tr -d ' ')
+
+            # 2. 如果没抓到，尝试从已生成的 .config 文件中提取 (最准确)
+            if [ -z "$KERNEL_VER" ] && [ -f builder/.config ]; then
+              KERNEL_VER=$(grep CONFIG_LINUX_ builder/.config 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+            fi
+
+            # 3. 兜底默认值
+            if [ -z "$KERNEL_VER" ]; then
+              KERNEL_VER="25.12 Standard Kernel"
+            fi
+
+            echo "Parsed Kernel Version: $KERNEL_VER"
+            echo "KERNEL_VER=$KERNEL_VER" >> $GITHUB_ENV
+          
 
           # 2. 提取离线包版本号
           cd builder/packages
