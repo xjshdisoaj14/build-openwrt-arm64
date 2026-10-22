@@ -300,7 +300,7 @@ jobs:
 
           # 写入 Release Body 说明文件
           cat <<EOF > $GITHUB_WORKSPACE/release_body.md
-          ## ImmortalWrt 25.12.1 (ARMSR / armv8) 精化版
+          ## ImmortalWrt 25.12.1 (ARMSR / armv8) OECT版
 
           - **构建日期**: $BUILD_DATE
           - **构建 ID**: ${{ github.run_id }}
