@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSR + Nikki)
+name: Build ImmortalWrt 25.12.1 (ARMSRoect + Nikki)
 
 on:
   workflow_dispatch:
