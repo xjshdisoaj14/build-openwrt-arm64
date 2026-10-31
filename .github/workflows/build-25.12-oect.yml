@@ -1,4 +1,4 @@
-name: Build ImmortalWrt 25.12.1 (ARMSRoot + Nikki 主用 / PassWall2 备用)
+name: Build ImmortalWrt 25.12.1 (ARMSRoot Nikki PassWall2)
 
 on:
   workflow_dispatch:
